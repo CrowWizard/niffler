@@ -1,7 +1,7 @@
 # Niffler — build without knowing Go, Nim or Wails.
 #
 #   make all    build core + components (default)
-#   make setup  install all prerequisites for this platform (Ubuntu/macOS)
+#   make setup  install all prerequisites for this platform (Debian/RHEL/macOS)
 #   make doctor check prerequisites and report what is missing
 #
 # Starting/stopping is not make's job: launch niffler-tui (it boots core on
@@ -15,8 +15,14 @@
 
 SHELL   := /bin/bash
 ROOT    := $(abspath .)
-# choosenim and Nimble-installed helpers.
-export PATH := $(HOME)/.nimble/bin:$(PATH)
+# choosenim and Nimble-installed helpers; official Go installs are a fallback.
+# Preserve any Go explicitly selected by the caller's PATH.
+export PATH := $(HOME)/.nimble/bin:$(PATH):/usr/local/go/bin
+
+# Check the installed compiler, without auto-downloading a module's minimum
+# toolchain (which may be an unpatched x.y.0 release). Packages supply updates;
+# newer module requirements can still use Go's normal GOTOOLCHAIN selection.
+GO_VERSION_OK = GOTOOLCHAIN=local go version 2>/dev/null | awk '$$3 ~ /^go[0-9]+\.[0-9]+(\.[0-9]+)?$$/ { sub(/^go/, "", $$3); split($$3, v, "."); ok = v[1] > 1 || (v[1] == 1 && v[2] >= 24) } END { exit !ok }'
 
 # platform detection for the setup/doctor targets
 UNAME_S := $(shell uname -s)
@@ -590,6 +596,11 @@ var/bin/fixture-image-tool: tests/fixtures/image_tool.nim $(SDK_NIM) $(NIM_CONF)
 var/bin/test_%: tests/%.nim tests/helpers.nim $(SDK_NIM) $(CORE_NIM) $(NIM_CONF) | var/bin
 	$(BUILD_WRAP) nim c --hints:off $(NIMFLAGS) --path:sdk -o:$@ tests/$*.nim
 
+# Generic focused entry point for tests without a specialized target below.
+# Explicit targets keep their extra prerequisites and runtime handling.
+test-%: build var/bin/test_t_%
+	$(TEST_LOCK) $(TEST_ENV) ./var/bin/test_t_$*
+
 # The sandbox launcher (sandbox/) is a helper binary, not a component: it has
 # no NATS surface and is exec'd by a component. Not in the manifest.
 var/bin/test_t_sandbox: tests/t_sandbox.nim sandbox/policy.nim $(NIM_CONF)
@@ -862,7 +873,9 @@ doctor:
 	done; \
 	if [ -z "$$missing" ]; then echo "  Nim packages: OK"; \
 	else echo "  Nim packages MISSING:$$missing — run 'make install-nim-deps'"; fi
-	$(call check_tool,go,install-go)
+	@if $(GO_VERSION_OK); then \
+		echo "  go (local 1.24+): OK"; \
+	else echo "  go: MISSING or older than 1.24 — run 'make install-go'"; fi
 	@if [ -x var/bin/nats-server ]; then \
 		echo "  nats-server: OK (bundled, var/bin)"; \
 	else \
@@ -890,10 +903,24 @@ doctor:
 	@echo "Then: make — then launch niffler-tui (the client) or ./var/bin/niffler (admin shell)"
 
 install-go:
-	@if command -v go >/dev/null 2>&1; then echo "go: already installed"; \
-	elif [ -n "$(IS_MAC)" ]; then brew install go; \
-	elif command -v snap >/dev/null 2>&1; then $(SUDO) snap install go --classic; \
-	else echo "Install Go from https://go.dev/dl (or use your package manager)"; fi
+	@set -e; if $(GO_VERSION_OK); then echo "go: installed (local 1.24+)"; exit 0; fi; \
+	echo "Go 1.24+ required; installing/updating the platform package ..."; \
+	if [ -n "$(IS_MAC)" ]; then \
+		if brew list --versions go >/dev/null 2>&1; then brew upgrade go; else brew install go; fi; \
+	elif command -v dnf >/dev/null 2>&1; then $(SUDO) dnf install -y golang; \
+	elif command -v yum >/dev/null 2>&1; then $(SUDO) yum install -y golang; \
+	elif command -v apt-get >/dev/null 2>&1; then \
+		$(SUDO) apt-get update && $(SUDO) apt-get install -y golang-go; \
+	elif command -v snap >/dev/null 2>&1; then \
+		if snap list go >/dev/null 2>&1; then $(SUDO) snap refresh go; else $(SUDO) snap install go --classic; fi; \
+	else echo "Install a current supported Go release from https://go.dev/dl"; exit 1; fi; \
+	hash -r; \
+	if ! $(GO_VERSION_OK); then \
+		echo "Go on PATH is still missing or older than 1.24 ($$(command -v go || true))." >&2; \
+		echo "Install a current supported Go release from https://go.dev/dl and select it on PATH." >&2; \
+		echo "GOTOOLCHAIN=auto may download a module's minimum x.y.0; it does not ensure current patches." >&2; \
+		exit 1; \
+	fi
 
 install-lsp:
 	@# Language servers behind the lsp component defaults (gopls, nimtortoise,
@@ -936,10 +963,19 @@ install-native-deps:
 	@if [ -n "$(IS_MAC)" ]; then \
 		xcode-select -p >/dev/null 2>&1 || { echo "Install Xcode command-line tools: xcode-select --install"; exit 1; }; \
 		brew install pkg-config; \
-	else \
+	elif command -v apt-get >/dev/null 2>&1; then \
 		$(SUDO) apt-get update && \
 		$(SUDO) apt-get install -y build-essential curl ca-certificates git \
-			pkg-config libssl-dev; fi
+			pkg-config libssl-dev; \
+	elif command -v dnf >/dev/null 2>&1; then \
+		$(SUDO) dnf install -y gcc gcc-c++ make curl ca-certificates git \
+			pkgconf-pkg-config openssl-devel; \
+	elif command -v yum >/dev/null 2>&1; then \
+		$(SUDO) yum install -y gcc gcc-c++ make curl ca-certificates git \
+			pkgconfig openssl-devel; \
+	else \
+		echo "Unsupported Linux package manager; install a C/C++ toolchain, curl, git, pkg-config and OpenSSL development headers manually" >&2; exit 1; \
+	fi
 
 install-nim:
 	@if ! command -v nim >/dev/null 2>&1; then \

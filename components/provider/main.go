@@ -41,7 +41,9 @@ const (
 	authAPIKey = "api_key"
 	authOAuth  = "oauth"
 
-	protocolOpenAI    = "openai-chat"
+	protocolResponses = "openai-responses"
+	protocolOpenAI    = "openai-chat-completions"
+	protocolChatAlias = "openai-chat"
 	protocolCodex     = "openai-codex"
 	protocolAnthropic = "anthropic"
 )
@@ -142,7 +144,7 @@ func environmentProvider() Provider {
 	return Provider{
 		Nickname:     "default",
 		AuthType:     authAPIKey,
-		Protocol:     protocolOpenAI,
+		Protocol:     protocolFromEnvironment(),
 		APIKey:       os.Getenv("NIF_OPENAI_API_KEY"),
 		BaseURL:      baseURL,
 		Model:        model,
@@ -150,6 +152,14 @@ func environmentProvider() Provider {
 		EmbedBaseURL: os.Getenv("NIF_OPENAI_EMBED_BASE_URL"),
 		Catalog:      os.Getenv("NIF_OPENAI_PROVIDER"),
 	}
+}
+
+func protocolFromEnvironment() string {
+	value := strings.TrimSpace(os.Getenv("NIF_OPENAI_PROTOCOL"))
+	if value == "" || value == protocolChatAlias {
+		return protocolOpenAI
+	}
+	return value
 }
 
 func (p Provider) withDefaults() Provider {
@@ -161,6 +171,9 @@ func (p Provider) withDefaults() Provider {
 		}
 	}
 	if p.Protocol == "" {
+		p.Protocol = protocolOpenAI
+	}
+	if p.Protocol == protocolChatAlias {
 		p.Protocol = protocolOpenAI
 	}
 	if p.BaseURL == "" {
@@ -208,7 +221,7 @@ func (p Provider) hasCredential() bool {
 }
 
 func validProtocol(value string) bool {
-	return value == protocolOpenAI || value == protocolCodex || value == protocolAnthropic
+	return value == protocolResponses || value == protocolOpenAI || value == protocolChatAlias || value == protocolCodex || value == protocolAnthropic
 }
 
 func validStoredProvider(p Provider) bool {
@@ -348,7 +361,7 @@ func main() {
 		"properties": map[string]any{
 			"nickname":     map[string]any{"type": "string", "description": "Provider nickname (e.g. deepseek, openrouter, local)"},
 			"apiKey":       map[string]any{"type": "string", "description": "API key / secret"},
-			"protocol":     map[string]any{"type": "string", "enum": []string{protocolOpenAI, protocolAnthropic}, "description": "Wire API (default openai-chat)"},
+			"protocol":     map[string]any{"type": "string", "enum": []string{protocolResponses, protocolOpenAI, protocolAnthropic}, "description": "Wire API (default openai-chat-completions)"},
 			"baseUrl":      map[string]any{"type": "string", "description": "Optional base URL (defaults by nickname/protocol)"},
 			"model":        map[string]any{"type": "string", "description": "Default model id"},
 			"embedModel":   map[string]any{"type": "string", "description": "Embedding model this provider serves (optional; separate from the chat model)"},
@@ -393,7 +406,7 @@ func main() {
 			args.Protocol = protocolOpenAI
 		}
 		if !validProtocol(args.Protocol) || args.Protocol == protocolCodex {
-			return nil, errors.New("protocol must be openai-chat or anthropic for API-key providers")
+			return nil, errors.New("protocol must be openai-responses, openai-chat-completions, or anthropic for API-key providers")
 		}
 		if args.Context < 0 {
 			return nil, errors.New("context must be non-negative")
@@ -465,7 +478,7 @@ func main() {
 		"properties": map[string]any{
 			"nickname":     map[string]any{"type": "string"},
 			"apiKey":       map[string]any{"type": "string", "description": "Optional replacement API-key credential; omitted preserves the current credential"},
-			"protocol":     map[string]any{"type": "string", "enum": []string{protocolOpenAI, protocolCodex, protocolAnthropic}},
+			"protocol":     map[string]any{"type": "string", "enum": []string{protocolResponses, protocolOpenAI, protocolCodex, protocolAnthropic}},
 			"baseUrl":      map[string]any{"type": "string"},
 			"model":        map[string]any{"type": "string"},
 			"embedModel":   map[string]any{"type": "string", "description": "Embedding model this provider serves; an empty string clears it"},
@@ -521,8 +534,8 @@ func main() {
 		}
 		if args.Protocol != nil {
 			protocol := strings.TrimSpace(*args.Protocol)
-			if !validProtocol(protocol) {
-				return nil, errors.New("invalid protocol")
+			if !validProtocol(protocol) || (protocol == protocolCodex && p.AuthType != authOAuth) {
+				return nil, errors.New("invalid protocol for provider authentication type")
 			}
 			if p.AuthType == authOAuth && protocol != p.Protocol {
 				return nil, errors.New("OAuth provider protocol cannot be changed; sign in again")

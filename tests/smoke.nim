@@ -57,7 +57,7 @@ proc main() =
   natsSubscription_Destroy(sub)
 
   # call svc.bash.call with a call envelope
-  let callEnv = callEnvelope("bash", %*{"command": "echo hello-from-bash; ls /nonexistent; echo done", "timeoutMs": 10000})
+  let callEnv = callEnvelope("bash", %*{"command": "echo hello-from-bash; LC_ALL=C ls /nonexistent; echo done", "timeoutMs": 10000})
   let data = callEnv.encode()
   var reply: ptr natsMsg
   let r = natsConnection_Request(addr reply, nc.conn, "svc.bash.call".cstring,

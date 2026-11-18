@@ -171,6 +171,12 @@ else
       say "step 1/5 — pristine machine, installing:$missing (apt)"
       run $SUDO apt-get update
       run $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y $missing ca-certificates
+    elif command -v dnf >/dev/null 2>&1; then
+      say "step 1/5 — pristine machine, installing:$missing (dnf)"
+      run $SUDO dnf install -y $missing ca-certificates
+    elif command -v yum >/dev/null 2>&1; then
+      say "step 1/5 — pristine machine, installing:$missing (yum)"
+      run $SUDO yum install -y $missing ca-certificates
     else
       die "missing:$missing — install them first. macOS: xcode-select --install (plus Homebrew from brew.sh); Linux: your package manager. Then re-run."
     fi
@@ -182,11 +188,16 @@ else
     elif command -v brew >/dev/null 2>&1; then
       say "step 1/5 — installing Go (brew)"
       run brew install go
-    elif command -v apt-get >/dev/null 2>&1; then
+    elif command -v apt-get >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
       say "step 1/5 — installing Go from go.dev (current stable)"
       GOV="$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -1)"
       [ -n "$GOV" ] || die "cannot resolve the current Go version from go.dev — install Go manually: https://go.dev/dl"
-      ARCH="$(dpkg --print-architecture)"
+      case "$(uname -m)" in
+        x86_64|amd64) ARCH=amd64 ;;
+        aarch64|arm64) ARCH=arm64 ;;
+        armv6l|armv7l) ARCH=armv6l ;;
+        *) die "unsupported Go architecture: $(uname -m)" ;;
+      esac
       run curl -fsSL "https://go.dev/dl/${GOV}.linux-${ARCH}.tar.gz" -o /tmp/niffler-go.tgz
       run $SUDO rm -rf /usr/local/go
       run $SUDO tar -C /usr/local -xzf /tmp/niffler-go.tgz

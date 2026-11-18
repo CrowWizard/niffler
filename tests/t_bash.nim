@@ -136,7 +136,8 @@ proc main() =
         var routes = 0
         for line in r.output.splitLines():
           let t = line.strip()
-          if t.len > 0 and not t.startsWith("Iface"): inc routes
+          if t.len > 0 and not t.startsWith("Iface") and t != "local-ok":
+            inc routes
         check("no routes out of the namespace", routes == 0, r.output)
       else:
         echo "NOTE: unprivileged user namespaces blocked here — netns wrap untestable"

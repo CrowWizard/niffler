@@ -450,18 +450,23 @@ proc main() =
 
   # --- reasoning-effort passthrough: the child's LLM sees what was sent ----
   let thinkParent = "agt-think"
-  discard call(nc, "core", "session",
-               %*{"sessionId": thinkParent, "content": "go"}, 120_000)
+  let thinkTurn = call(nc, "core", "session",
+                       %*{"sessionId": thinkParent, "content": "go"}, 120_000)
+  check("thinking parent turn completed",
+        thinkTurn{"reply"}.getStr("") == "agent-turn-done", $thinkTurn)
   var thinkReply = ""
+  var thinkTranscript = newJArray()
   for i in 1 .. 6:
     let m = call(nc, "store", "get",
                  %*{"kind": "message",
                     "id": thinkParent & ":" & align($i, 6, '0')}, 10_000)
+    thinkTranscript.add(m)
     if m{"error"} != nil: break
     let content = m{"value"}{"content"}.getStr("")
     if content.contains("thinking:"): thinkReply = content
   check("thinking effort reaches the child's LLM",
-        thinkReply.contains("thinking:high"), thinkReply)
+        thinkReply.contains("thinking:high"),
+        "session response: " & $thinkTurn & "\ntranscript: " & $thinkTranscript)
 
   # --- job time budget: exceeded budgets cancel with agent_stop semantics --
   let budgetParent = "agt-budget"

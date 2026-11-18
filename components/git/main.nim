@@ -118,7 +118,8 @@ proc runGit(args: seq[string], timeoutMs: int): tuple[code: int, output: string]
       "resolved past the git component's own binary) — install it " &
       "(e.g. `sudo apt install git`) or use bash for git operations"
     return
-  runArgv(gGitPath, args, timeoutMs)
+  # Structured error handling below depends on Git's diagnostic text.
+  runArgv("env", @["LC_ALL=C", gGitPath] & args, timeoutMs)
 
 proc finish(code: int, output: string, maxLines = 10_000): JsonNode =
   ## Shared result shape: git exit code + line-capped, byte-capped output;

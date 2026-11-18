@@ -80,7 +80,7 @@ A one-file index of every shipped capability (not a reference) is
 | `repomap` | Nim | optional | ranked workspace map (docs/research/REPOMAP.md): the load-bearing files and their key definitions in ~1KB, built from a tree-sitter + native-Nim tags graph with personalized PageRank (the aider repomap port). `repo_map {workspace?, focus?, mentionedIdents?, budget?}` is onDemand and read-effect. Workspace-open auto-append (one append-only history entry on `ev.workspace.opened`) is **on by default but gated** (`docs/research/REPOMAP-GATES.md`): the workspace must have at least 50 covered files, and its rendered map must have at least 800 bytes, 25 symbols and 5 symbol-bearing files. A small/stub map is withheld and logged as `repo map withheld`; set `NIF_REPOMAP_AUTOAPPEND=0` to disable the append. The explicit `repo_map` tool is available regardless of these gates. Cache: `var/repomap-tags/` (mtime-keyed). Optional component — absent means no map, nothing else changes. Parameters, tag tiers and append payload: [`repomap` in detail](#repomap-in-detail) |
 | `processes` | Nim | optional | long-running commands with an owner: `process_start` (detached, own process group, returns an id at once), `process_poll` (drains incremental output), `process_kill` (stops the group), `process_list` — see [Background processes](#background-processes-processes) |
 | `builder` | Nim | required | compiles agent-written Nim/Go/TypeScript source with `build {lang, name, source, files?, defines?}`, and builds manifest-v2 plugin projects with `build_package {name, lang, sourceRoot, project, steps, artifact}` (approval-gated, on demand). Package projects keep their own dependency manifests and lockfiles; the builder stages them, expands only controlled SDK/output placeholders, executes bounded argv recipes, validates the declared `executable`/`node` artifact, and returns the published binary/runtime bundle. Recipes may combine toolchains (for example `npm ci` followed by `wails build`); recipes use a bounded argv tool set and cannot invoke a shell wrapper. `info` returns SDK paths, the global tool-naming rule, and both build flows |
-| `llm` | Go | required | streaming chat adapter — four hidden tools, none of them in a conversation's direct set: `chat` (one inference, `ev.llm.token` deltas, cancellation; `runner`-exempt, timeout `NIF_LLM_TIMEOUT_MS`), `llm_resolve` (the credential-free resolution probe clients call), `llm_models_source` (the `x-models-source` v1 live-id source the `models` catalog calls) and `embed` (one embeddings call through the provider's `embedModel`) — protocols: OpenAI-compatible Chat Completions, OpenAI Codex (ChatGPT OAuth) Responses and Anthropic Messages; `llm-openai` in `components/llm-openai` is the minimal non-streaming example (it reads only `NIF_OPENAI_API_KEY`, `NIF_OPENAI_BASE_URL`, `NIF_OPENAI_MODEL` and `NIF_OPENAI_CONTEXT` — not `NIF_OPENAI_PROVIDER` — and always sends `max_tokens: 32768`, a hardcoded value with no knob); swap it in via `manifest.yaml` — comment `llm` out in the same edit, since `chat` is a globally unique tool name and a duplicate registration is refused; `make build` builds `var/bin/llm-openai` either way. Expect nothing beyond the chat contract: no `ev.llm.token` streaming, no cancel, no `finish_reason`, no `llm_resolve` (core degrades gracefully on the last one) and no `embed` |
+| `llm` | Go | required | streaming chat adapter — four hidden tools, none of them in a conversation's direct set: `chat` (one inference, `ev.llm.token` deltas, cancellation; `runner`-exempt, timeout `NIF_LLM_TIMEOUT_MS`), `llm_resolve` (the credential-free resolution probe clients call), `llm_models_source` (the `x-models-source` v1 live-id source the `models` catalog calls) and `embed` (one embeddings call through the provider's `embedModel`) — protocols: OpenAI-compatible Chat Completions, API-key Responses, OpenAI Codex (ChatGPT OAuth) Responses and Anthropic Messages; `llm-openai` in `components/llm-openai` is the minimal non-streaming example (it reads only `NIF_OPENAI_API_KEY`, `NIF_OPENAI_BASE_URL`, `NIF_OPENAI_MODEL` and `NIF_OPENAI_CONTEXT` — not `NIF_OPENAI_PROVIDER` — and always sends `max_tokens: 32768`, a hardcoded value with no knob); swap it in via `manifest.yaml` — comment `llm` out in the same edit, since `chat` is a globally unique tool name and a duplicate registration is refused; `make build` builds `var/bin/llm-openai` either way. Expect nothing beyond the chat contract: no `ev.llm.token` streaming, no cancel, no `finish_reason`, no `llm_resolve` (core degrades gracefully on the last one) and no `embed` |
 | `models` | Go | optional | models.dev provider/model catalog, atomic cache, strict resolution, and plugin correction/discovery layers (see [Model catalog](#model-catalog-models)) |
 | `provider` | Go | optional | store-backed LLM provider registry: `provider_add`/`list`/`switch`/`active`/`remove`/`export`/`import`, subscription OAuth login (`provider_oauth_start`/`complete`/`cancel`), `ev.provider.switch` notifications |
 | `plugins` | Nim | optional | ecosystem front door: topic search + install/update/remove of packages |
@@ -681,7 +681,8 @@ see [The `.env` file](#the-env-file)) and inherit core's environment. `NIF_BIN_D
 | `NIF_GIT_MIRROR` | host prefix replacing `https://github.com` when the `plugins` component clones packages (e.g. `https://cnb.cool` or a Gitee mirror) — API/search endpoints stay on GitHub | unset |
 | `NIF_NPM_REGISTRY` | npm registry for `builder` ts-component installs (e.g. `https://registry.npmmirror.com`) | npm default |
 | `NIF_OPENAI_API_KEY` | API key for the LLM adapter (`llm`). Required for any conversation turn; with no key at all the adapter refuses before any HTTP request (`provider "default": no API key (set NIF_OPENAI_API_KEY or NIF_LLM_PROVIDERS apiKey)`), which is a different symptom from a key that exists but is rejected (HTTP 401/403) | — |
-| `NIF_OPENAI_BASE_URL` | OpenAI-compatible endpoint | `https://api.openai.com/v1` |
+| `NIF_OPENAI_BASE_URL` | base URL for the selected protocol (without `/chat/completions` or `/responses`) | `https://api.openai.com/v1` |
+| `NIF_OPENAI_PROTOCOL` | default environment connection protocol: `openai-chat-completions`, `openai-responses` or `anthropic`; legacy `openai-chat` remains a compatible alias for `openai-chat-completions`. Responses uses `baseUrl + /responses` with Bearer API-key authentication; `openai-codex` remains OAuth-only | `openai-chat-completions` |
 | `NIF_OPENAI_MODEL` | model name | `deepseek-chat` |
 | `NIF_OPENAI_PROVIDER` | models catalog provider id for the default LLM connection; common endpoints are inferred when unset | inferred |
 | `NIF_OPENAI_CONTEXT` | explicit context window (tokens) the llm reports to core's context guard. Resolution order: stored provider `context` → this → `models` catalog → `llm`'s built-in table (`deepseek-chat`/`deepseek-reasoner` 1M, `syn:large:text` 524288, `zai-org/glm-5.3-flash` 524288 — code-resident, so a new model needs a source change) → 128000 (the `llm-openai` swap-in example resolves only `NIF_OPENAI_CONTEXT` → a two-entry `deepseek-chat`/`deepseek-reasoner` table → `128000`, and re-reads the variable on every call) | `models` catalog, then the built-in table, then `128000` |
@@ -689,7 +690,7 @@ see [The `.env` file](#the-env-file)) and inherit core's environment. `NIF_BIN_D
 | `NIF_AGENT_DEFAULT_TIER` | tier ceiling used when the parent's exact model is not present in the configured ladder (`weak`, `medium`, or `strong`) | `strong` |
 | `NIF_AGENT_WAKES` | consecutive autonomous wake turns a conversation may run after a background subagent settles while it is idle (docs/WIRE.md "Autonomous wake"); the human's next message resets the budget, `0` disables waking (the notice then waits for the next turn's pull drain) | `3` |
 | `NIF_AGENT_NOTICE_HOLD` | `0` lets a turn close even when a settlement notice arrived during its final step (the notice waits for the next turn's drain); by default the turn is held open one extra step so it cannot close over a child that just finished (docs/WIRE.md "Busy-parent inbox") | `1` |
-| `NIF_LLM_PROVIDERS` | JSON object of named providers `{nickname: {baseUrl, apiKey, model, context, catalog, protocol?, authType?, accountId?, stripPrefix?}}` the `chat` tool's `provider` arg resolves. `protocol` is `openai-chat` (default), `anthropic` or `openai-codex`; `authType` defaults to `api_key`; `stripPrefix` rewrites a namespaced id (`alibaba/glm-5.2` → `glm-5.2`) for gateways that route on the canonical id; `accountId` is the ChatGPT account id the Codex lane's headers carry, derived from the OAuth token when the record does not hold one (with neither, the call fails with `OpenAI Codex OAuth token has no ChatGPT account id; sign in again`). Malformed JSON and a missing `apiKey` each fail the call explicitly. The provider registry (`provider` component) supersedes the default when active | `{}` |
+| `NIF_LLM_PROVIDERS` | JSON object of named providers `{nickname: {baseUrl, apiKey, model, context, catalog, protocol?, authType?, accountId?, stripPrefix?}}` the `chat` tool's `provider` arg resolves. `protocol` is `openai-chat-completions` (default; legacy alias `openai-chat`), `openai-responses`, `anthropic` or OAuth-only `openai-codex`; `authType` defaults to `api_key`; `stripPrefix` rewrites a namespaced id (`alibaba/glm-5.2` → `glm-5.2`) for gateways that route on the canonical id; `accountId` is the ChatGPT account id the Codex lane's headers carry, derived from the OAuth token when the record does not hold one (with neither, the call fails with `OpenAI Codex OAuth token has no ChatGPT account id; sign in again`). Malformed JSON and a missing `apiKey` each fail the call explicitly. The provider registry (`provider` component) supersedes the default when active | `{}` |
 | `NIF_MODELS_URL` | models.dev-compatible catalog base or JSON endpoint | `https://models.dev/api.json` |
 | `NIF_MODELS_PATH` | pinned local baseline catalog: while set, this file *is* the baseline — the component never downloads `NIF_MODELS_URL` (not even with `models_refresh {force: true}`) and picks up changes to the file on the next refresh. Plugin sources and `NIF_MODELS_OVERRIDE` still apply | unset |
 | `NIF_MODELS_OVERRIDE` | local JSON Merge Patch applied after every plugin source | unset |
@@ -1987,7 +1988,7 @@ OAuth tools are `x-harness.hidden` (clients only — `invoke` refuses them).
 
 | Tool | What it does |
 |---|---|
-| `provider_add {nickname, apiKey, protocol?, baseUrl?, model?, catalog?, context?, plugin?, stripPrefix?, active?}` | add or overwrite an API-key provider (upsert by nickname; `protocol`: `openai-chat` default or `anthropic`); the first provider — API-key or OAuth — becomes active automatically unless `active: false`; `stripPrefix` sends a namespaced model id without its `vendor/` prefix for gateways that route on the canonical id (e.g. `glm-5.2` for `alibaba/glm-5.2`); response is redacted |
+| `provider_add {nickname, apiKey, protocol?, baseUrl?, model?, catalog?, context?, plugin?, stripPrefix?, active?}` | add or overwrite an API-key provider (upsert by nickname; `protocol`: `openai-chat-completions` default, `openai-responses` or `anthropic`; legacy `openai-chat` is accepted); the first provider — API-key or OAuth — becomes active automatically unless `active: false`; `stripPrefix` sends a namespaced model id without its `vendor/` prefix for gateways that route on the canonical id (e.g. `glm-5.2` for `alibaba/glm-5.2`); response is redacted |
 | `provider_update {nickname, apiKey?, protocol?, baseUrl?, model?, catalog?, context?, plugin?, stripPrefix?}` | hidden client API for partial updates; omitted API key is preserved |
 | `provider_oauth_start {protocol, method?, nickname?, model?, active?}` | hidden, start a subscription login: `protocol` `openai-codex` (ChatGPT Plus/Pro) or `anthropic` (Claude Pro/Max); `method` `browser` (local callback) or `device` (headless, OpenAI only). Returns `{flowId, url, userCode?, callbackAvailable, expiresAt}` |
 | `provider_oauth_complete {flowId, code?}` | hidden, poll/finish a login; returns `{pending, retryAfterMs?}` until the callback (or pasted `code`) lands, then stores the provider and reports it redacted |
@@ -2057,8 +2058,11 @@ Two limits, stated rather than papered over:
 
 Each provider carries a `protocol` that `llm` routes on:
 
-- `openai-chat` — the OpenAI-compatible Chat Completions endpoint (default;
-  DeepSeek, OpenRouter, local vLLM, …).
+- `openai-chat-completions` — the OpenAI-compatible Chat Completions endpoint
+  (default; DeepSeek, OpenRouter, local vLLM, …); `openai-chat` remains a
+  compatible legacy alias.
+- `openai-responses` — the API-key Responses endpoint (`baseUrl + /responses`)
+  with `Authorization: Bearer <apiKey>`; supports custom base URLs.
 - `openai-codex` — ChatGPT's Codex Responses endpoint
   (`https://chatgpt.com/backend-api/codex/responses`) with ChatGPT OAuth
   headers (`chatgpt-account-id`, `OpenAI-Beta: responses=experimental`);
@@ -2071,13 +2075,21 @@ Each provider carries a `protocol` that `llm` routes on:
   blocks (consecutive tool results merge into one user message); its usage is
   normalized for core's counters — `prompt_tokens` is input + cache reads +
   cache writes, while only cache **reads** count as cached tokens (cache
-  writes are billed at write rates). Across all three protocols a `usage`
+  writes are billed at write rates). Across all four protocols a `usage`
   object accompanies the result only when the provider reported non-zero
   tokens.
 
-An API-key provider may use `openai-chat` or `anthropic` only: `openai-codex`
+An API-key provider may use `openai-chat-completions`, `openai-responses` or
+`anthropic` (legacy `openai-chat` is also accepted): `openai-codex`
 requires a ChatGPT subscription login (`provider_oauth_start`), and
 `provider_add` refuses the combination.
+
+Each `NIF_LLM_PROVIDERS` entry selects its own `protocol`; for example
+(placeholder keys only):
+
+```dotenv
+NIF_LLM_PROVIDERS={"chat":{"protocol":"openai-chat-completions","baseUrl":"https://api.openai.com/v1","apiKey":"sk-...","model":"gpt-5.4"},"responses":{"protocol":"openai-responses","baseUrl":"https://api.openai.com/v1","apiKey":"sk-...","model":"gpt-5.4"},"claude":{"protocol":"anthropic","baseUrl":"https://api.anthropic.com/v1","apiKey":"sk-ant-...","model":"claude-sonnet-4-6"}}
+```
 
 ### Output caps and `finish_reason`
 

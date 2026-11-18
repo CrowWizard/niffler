@@ -36,23 +36,39 @@ func (t codexHeaderTransport) RoundTrip(request *http.Request) (*http.Response, 
 
 func chatCodex(ctx context.Context, c *sdk.Component, p provider, model, providerName string,
 	args chatArgs, contextSize int) (any, error) {
-	accountID := p.AccountID
-	if accountID == "" {
-		accountID = codexAccountID(p.APIKey)
-	}
-	if accountID == "" {
-		return nil, errors.New("OpenAI Codex OAuth token has no ChatGPT account id; sign in again")
-	}
-	baseTransport := http.DefaultTransport
-	httpClient := &http.Client{Transport: codexHeaderTransport{
-		base: baseTransport, accountID: accountID, sessionID: args.SessionID,
-	}}
-	cfg := openai.DefaultConfig(p.APIKey)
-	cfg.BaseURL = codexBaseURL(p.BaseURL)
-	cfg.HTTPClient = httpClient
-	client := openai.NewClientWithConfig(cfg)
+	return chatResponses(ctx, c, p, model, providerName, args, contextSize, 0, true)
+}
 
-	request, err := codexRequest(model, args)
+func chatResponses(ctx context.Context, c *sdk.Component, p provider, model, providerName string,
+	args chatArgs, contextSize, output int, codex bool) (any, error) {
+	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+	if codex {
+		accountID := p.AccountID
+		if accountID == "" {
+			accountID = codexAccountID(p.APIKey)
+		}
+		if accountID == "" {
+			return nil, errors.New("OpenAI Codex OAuth token has no ChatGPT account id; sign in again")
+		}
+		baseTransport := http.DefaultTransport
+		httpClient := &http.Client{Transport: codexHeaderTransport{
+			base: baseTransport, accountID: accountID, sessionID: args.SessionID,
+		}}
+		baseURL = codexBaseURL(baseURL)
+		cfg := openai.DefaultConfig(p.APIKey)
+		cfg.BaseURL = baseURL
+		cfg.HTTPClient = &retryAfterHTTPClient{base: httpClient}
+		return chatResponsesWithClient(ctx, c, openai.NewClientWithConfig(cfg), model, providerName, args, contextSize, output, true)
+	}
+	cfg := openai.DefaultConfig(p.APIKey)
+	cfg.BaseURL = baseURL
+	cfg.HTTPClient = &retryAfterHTTPClient{base: cfg.HTTPClient}
+	return chatResponsesWithClient(ctx, c, openai.NewClientWithConfig(cfg), model, providerName, args, contextSize, output, false)
+}
+
+func chatResponsesWithClient(ctx context.Context, c *sdk.Component, client *openai.Client, model, providerName string,
+	args chatArgs, contextSize, output int, codex bool) (any, error) {
+	request, err := responsesRequest(model, args, output, codex)
 	if err != nil {
 		return nil, err
 	}
@@ -128,14 +144,14 @@ func chatCodex(ctx context.Context, c *sdk.Component, p provider, model, provide
 				message = event.Error.Message
 			}
 			if message == "" {
-				message = "unknown Codex stream error"
+				message = "unknown Responses API stream error"
 			}
-			return nil, fmt.Errorf("Codex: %s", message)
+			return nil, fmt.Errorf("Responses API: %s", message)
 		case "response.failed":
 			if event.Response != nil && event.Response.Error != nil {
-				return nil, fmt.Errorf("Codex: %s", event.Response.Error.Message)
+				return nil, fmt.Errorf("Responses API: %s", event.Response.Error.Message)
 			}
-			return nil, errors.New("Codex response failed")
+			return nil, errors.New("Responses API response failed")
 		case "response.completed", "response.done", "response.incomplete":
 			terminal = true
 			if event.Type == "response.incomplete" {
@@ -149,7 +165,7 @@ func chatCodex(ctx context.Context, c *sdk.Component, p provider, model, provide
 					usedModel = event.Response.Model
 				}
 				if event.Response.Error != nil {
-					return nil, fmt.Errorf("Codex: %s", event.Response.Error.Message)
+					return nil, fmt.Errorf("Responses API: %s", event.Response.Error.Message)
 				}
 				if event.Response.Usage != nil {
 					usage = responseUsage(*event.Response.Usage)
@@ -169,7 +185,7 @@ func chatCodex(ctx context.Context, c *sdk.Component, p provider, model, provide
 		}
 	}
 	if !terminal {
-		return nil, errors.New("Codex stream ended without a terminal response")
+		return nil, errors.New("Responses API stream ended without a terminal response")
 	}
 
 	toolCalls := orderedCodexCalls(calls)
@@ -177,7 +193,7 @@ func chatCodex(ctx context.Context, c *sdk.Component, p provider, model, provide
 		toolCalls, usage, 0, usageSeen, finish)
 }
 
-func codexRequest(model string, args chatArgs) (openai.CreateResponseRequest, error) {
+func responsesRequest(model string, args chatArgs, output int, codex bool) (openai.CreateResponseRequest, error) {
 	instructions, input := codexInput(args.Messages)
 	tools := make([]openai.ResponseTool, 0, len(args.Tools))
 	for _, tool := range args.Tools {
@@ -186,10 +202,9 @@ func codexRequest(model string, args chatArgs) (openai.CreateResponseRequest, er
 		}
 		function := *tool.Function
 		function.Parameters = cleanToolSchema(function.Parameters)
-		// ChatGPT's Codex endpoint currently expects nullable strict rather than
-		// OpenAI's nested Chat Completions tool shape. NewResponseFunctionTool
-		// emits the inline Responses API representation.
-		function.Strict = false
+		if codex {
+			function.Strict = false
+		}
 		tools = append(tools, openai.NewResponseFunctionTool(function))
 	}
 	store := false
@@ -202,9 +217,12 @@ func codexRequest(model string, args chatArgs) (openai.CreateResponseRequest, er
 		ToolChoice:        "auto",
 		ParallelToolCalls: &parallel,
 		Store:             &store,
-		Include:           []openai.ResponseInclude{openai.ResponseIncludeReasoningEncryptedContent},
-		Text:              &openai.ResponseTextConfig{Verbosity: "low"},
-		PromptCacheKey:    codexCacheKey(args.SessionID),
+		MaxOutputTokens:   output,
+	}
+	if codex {
+		request.Include = []openai.ResponseInclude{openai.ResponseIncludeReasoningEncryptedContent}
+		request.Text = &openai.ResponseTextConfig{Verbosity: "low"}
+		request.PromptCacheKey = codexCacheKey(args.SessionID)
 	}
 	if args.ReasoningEffort != "" {
 		request.Reasoning = &openai.ResponseReasoning{
@@ -357,11 +375,18 @@ func orderedCodexCalls(calls map[int]*openai.ToolCall) []openai.ToolCall {
 }
 
 func responseUsage(usage openai.ResponseUsage) openai.Usage {
-	return openai.Usage{
+	result := openai.Usage{
 		PromptTokens:     usage.InputTokens,
 		CompletionTokens: usage.OutputTokens,
 		TotalTokens:      usage.TotalTokens,
 	}
+	if usage.InputTokensDetails != nil {
+		result.PromptTokensDetails = &openai.PromptTokensDetails{CachedTokens: usage.InputTokensDetails.CachedTokens}
+	}
+	if usage.OutputTokensDetails != nil {
+		result.CompletionTokensDetails = &openai.CompletionTokensDetails{ReasoningTokens: usage.OutputTokensDetails.ReasoningTokens}
+	}
+	return result
 }
 
 func emitLLMToken(c *sdk.Component, args chatArgs, content, reasoning string) {

@@ -54,7 +54,9 @@ import (
 // `provider` arg; `model` still overrides the provider's default.
 
 const (
-	protocolOpenAI    = "openai-chat"
+	protocolResponses = "openai-responses"
+	protocolOpenAI    = "openai-chat-completions"
+	protocolChatAlias = "openai-chat"
 	protocolCodex     = "openai-codex"
 	protocolAnthropic = "anthropic"
 	authAPIKey        = "api_key"
@@ -62,9 +64,10 @@ const (
 )
 
 type provider struct {
-	BaseURL string `json:"baseUrl"`
-	APIKey  string `json:"apiKey"`
-	Model   string `json:"model"`
+	BaseURL  string `json:"baseUrl"`
+	APIKey   string `json:"apiKey"`
+	Model    string `json:"model"`
+	Protocol string `json:"protocol"`
 	// EmbedModel is the provider's embedding model (empty = the provider
 	// serves no embeddings). EmbedBaseURL overrides BaseURL for embeddings
 	// only; both mirror the provider component's records.
@@ -72,12 +75,20 @@ type provider struct {
 	EmbedBaseURL string `json:"embedBaseUrl"`
 	Context      int    `json:"context"`
 	Catalog      string `json:"catalog"`
-	Protocol     string `json:"protocol"`
 	AuthType     string `json:"authType"`
 	AccountID    string `json:"accountId"`
 	// StripPrefix models a gateway that routes on the canonical id and
 	// rejects vendor-prefixed ids ("alibaba/glm-5.2"); send "glm-5.2".
 	StripPrefix bool `json:"stripPrefix"`
+}
+
+func normalizeProtocol(value string) string {
+	switch strings.TrimSpace(value) {
+	case "", protocolOpenAI, protocolChatAlias:
+		return protocolOpenAI
+	default:
+		return strings.TrimSpace(value)
+	}
 }
 
 const defaultProvider = "default"
@@ -419,7 +430,7 @@ func loadProviders() (map[string]provider, error) {
 			EmbedModel:   os.Getenv("NIF_OPENAI_EMBED_MODEL"),
 			EmbedBaseURL: os.Getenv("NIF_OPENAI_EMBED_BASE_URL"),
 			Catalog:      os.Getenv("NIF_OPENAI_PROVIDER"),
-			Protocol:     protocolOpenAI,
+			Protocol:     normalizeProtocol(os.Getenv("NIF_OPENAI_PROTOCOL")),
 			AuthType:     authAPIKey,
 		},
 	}
@@ -429,6 +440,7 @@ func loadProviders() (map[string]provider, error) {
 			return nil, fmt.Errorf("NIF_LLM_PROVIDERS: %w", err)
 		}
 		for k, p := range extra {
+			p.Protocol = normalizeProtocol(p.Protocol)
 			ps[k] = p
 		}
 	}
@@ -564,9 +576,7 @@ func envProvider(name string) (provider, string, error) {
 		return provider{}, "", fmt.Errorf("unknown provider %q (environment providers: %s)",
 			name, providerNames(providers))
 	}
-	if p.Protocol == "" {
-		p.Protocol = protocolOpenAI
-	}
+	p.Protocol = normalizeProtocol(p.Protocol)
 	if p.AuthType == "" {
 		p.AuthType = authAPIKey
 	}
@@ -577,10 +587,10 @@ func envProvider(name string) (provider, string, error) {
 }
 
 type registryResponse struct {
-	Ok     bool   `json:"ok"`
-	Code   string `json:"code"`
-	Error  string `json:"error"`
-	Source string `json:"source"`
+	Ok       bool   `json:"ok"`
+	Code     string `json:"code"`
+	Error    string `json:"error"`
+	Source   string `json:"source"`
 	Provider *struct {
 		Nickname string `json:"nickname"`
 		AuthType string `json:"authType"`
@@ -737,9 +747,7 @@ func classifyProviderReply(raw json.RawMessage, err error) providerLookup {
 		}
 	}
 	protocol := resp.Provider.Protocol
-	if protocol == "" {
-		protocol = protocolOpenAI
-	}
+	protocol = normalizeProtocol(protocol)
 	authType := resp.Provider.AuthType
 	if authType == "" {
 		authType = authAPIKey
@@ -958,7 +966,7 @@ func embedHandler(c *sdk.Component, raw json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if endpoint.Protocol != "" && endpoint.Protocol != protocolOpenAI {
+	if endpoint.Protocol != "" && endpoint.Protocol != protocolOpenAI && endpoint.Protocol != protocolResponses && endpoint.Protocol != protocolChatAlias {
 		// Ollama's native /api/embed and the Anthropic/Codex lanes are
 		// different request shapes; refusing beats sending a chat-shaped
 		// request the endpoint cannot answer. Ollama is reachable through
@@ -1184,7 +1192,11 @@ func chatDispatch(streamCtx context.Context, c *sdk.Component, resolved resolved
 		v, err := chatAnthropic(streamCtx, c, resolved.Provider, model, resolved.ProviderName, args,
 			resolved.Context, output)
 		return v, classifyProviderError(err, resolved.Context)
-	case "", protocolOpenAI:
+	case protocolResponses:
+		v, err := chatResponses(streamCtx, c, resolved.Provider, model, resolved.ProviderName, args,
+			resolved.Context, output, false)
+		return v, classifyProviderError(err, resolved.Context)
+	case "", protocolOpenAI, protocolChatAlias:
 		cfg := openai.DefaultConfig(resolved.Provider.APIKey)
 		cfg.BaseURL = resolved.Provider.BaseURL
 		cfg.HTTPClient = &retryAfterHTTPClient{base: cfg.HTTPClient}

@@ -33,10 +33,9 @@
 #             Optional, and the only tool here that asks before installing
 #             (default yes on a terminal).
 #
-# Installs from the platform package manager (apt on Debian/Ubuntu, brew on
-# macOS); sudo is used only for the system package install. Debian's fd/bat
-# renames get plain-name symlinks in ~/.local/bin so the names an agent
-# expects to type work everywhere.
+# Installs from the platform package manager (apt, dnf/yum, or brew); sudo is
+# used only for system packages. Debian's fd/bat renames get plain-name
+# symlinks in ~/.local/bin so the names an agent expects work everywhere.
 set -uo pipefail
 
 BIN="$HOME/.local/bin"
@@ -66,21 +65,34 @@ fail() { echo "FAIL $1 — $2"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-if [ "$(uname)" = "Darwin" ]; then PKGMGR=brew; else PKGMGR=apt; fi
+case "$(uname)" in
+  Darwin) PKGMGR=brew ;;
+  *)
+    if command -v apt-get >/dev/null 2>&1; then PKGMGR=apt
+    elif command -v dnf >/dev/null 2>&1; then PKGMGR=dnf
+    elif command -v yum >/dev/null 2>&1; then PKGMGR=yum
+    else PKGMGR=unknown
+    fi
+    ;;
+esac
 SUDO=""
 if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then SUDO=sudo; fi
 
 installPkg() {
   # installPkg <package> — one best-effort package install (0 = success).
-  if [ "$PKGMGR" = "brew" ]; then
-    brew install "$1"
-    return
-  fi
-  if [ "$updated" = 0 ]; then
-    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update
-    updated=1
-  fi
-  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "$1"
+  case "$PKGMGR" in
+    brew) brew install "$1"; return ;;
+    apt)
+      if [ "$updated" = 0 ]; then
+        $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update
+        updated=1
+      fi
+      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "$1"
+      ;;
+    dnf) $SUDO dnf install -y "$1" ;;
+    yum) $SUDO yum install -y "$1" ;;
+    *) return 1 ;;
+  esac
 }
 
 linkAs() {
@@ -93,30 +105,33 @@ linkAs() {
   echo "note: $2 -> $(command -v "$1") (in $BIN)"
 }
 
-# command|apt package|brew formula|alternate binary (Debian renames; empty =
-# same as command)
+# command|apt package|rpm package|brew formula|alternate binary (Debian
+# renames; empty = same as command)
 specs='
-jq|jq|jq|
-yq|yq|yq|
-rg|ripgrep|ripgrep|
-fd|fd-find|fd|fdfind
-fzf|fzf|fzf|
-bat|bat|bat|batcat
-tree|tree|tree|
-htop|htop|htop|
-wget|wget|wget|
-zip|zip|zip|
-unzip|unzip|unzip|
-sqlite3|sqlite3|sqlite3|
-gh|gh|gh|
+jq|jq|jq|jq|
+yq|yq|yq|yq|
+rg|ripgrep|ripgrep|ripgrep|
+fd|fd-find|fd-find|fd|fdfind
+fzf|fzf|fzf|fzf|
+bat|bat|bat|bat|batcat
+tree|tree|tree|tree|
+htop|htop|htop|htop|
+wget|wget|wget|wget|
+zip|zip|zip|zip|
+unzip|unzip|unzip|unzip|
+sqlite3|sqlite3|sqlite|sqlite3|
+gh|gh|gh|gh|
 '
 
-while IFS='|' read -r cmd aptpkg brewpkg alt; do
+while IFS='|' read -r cmd aptpkg rpmpkg brewpkg alt; do
   [ -n "$cmd" ] || continue
   wanted "$cmd" || continue
   [ -n "$alt" ] || alt="$cmd"
   pkg="$aptpkg"
-  [ "$PKGMGR" = "brew" ] && pkg="$brewpkg"
+  case "$PKGMGR" in
+    brew) pkg="$brewpkg" ;;
+    dnf|yum) pkg="$rpmpkg" ;;
+  esac
   if have "$cmd" || have "$alt"; then
     ok "$cmd"
     continue

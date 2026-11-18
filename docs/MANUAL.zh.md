@@ -76,7 +76,7 @@
 | `repomap` | Nim | 可选 | 排序的工作区地图（docs/research/REPOMAP.md）：约 1KB 的承重文件及其关键定义，由 tree-sitter + 原生 Nim 标签图与个性化 PageRank 构建（aider repomap 移植）。`repo_map {workspace?, focus?, mentionedIdents?, budget?}` 是 onDemand 且 read-effect。工作区打开时自动追加（在 `ev.workspace.opened` 上的一条仅追加历史条目）**默认开启但受门控**（`docs/research/REPOMAP-GATES.md`）：工作区必须至少有 50 个覆盖文件，且其渲染的地图必须至少有 800 字节、25 个符号和 5 个带符号的文件。小型/存根地图会被扣留并记录为 `repo map withheld`；设置 `NIF_REPOMAP_AUTOAPPEND=0` 可禁用追加。显式的 `repo_map` 工具无论这些门控如何都可用。缓存：`var/repomap-tags/`（以 mtime 为键）。可选组件 —— 缺失意味着没有地图，其他一切不变。参数、标签层级和追加载荷：[`repomap` 详解](#repomap-in-detail) |
 | `processes` | Nim | 可选 | 有所有者的长时间运行命令：`process_start`（分离，自己的进程组，立即返回一个 id）、`process_poll`（排空增量输出）、`process_kill`（停止进程组）、`process_list` —— 见[后台进程](#background-processes-processes) |
 | `builder` | Nim | 必需 | 用 `build {lang, name, source, files?, defines?}` 编译 agent 编写的 Nim/Go/TypeScript 源码，并用 `build_package {name, lang, sourceRoot, project, steps, artifact}` 构建 manifest-v2 插件项目（审批门控，按需）。包项目保留自己的依赖清单和锁文件；builder 暂存它们，仅展开受控的 SDK/输出占位符，执行有界的 argv 配方，验证声明的 `executable`/`node` 产物，并返回发布的二进制/运行时包。配方可以组合工具链（例如 `npm ci` 后跟 `wails build`）；配方使用有界的 argv 工具集，不能调用 shell 包装器。`info` 返回 SDK 路径、全局工具命名规则以及两种构建流程 |
-| `llm` | Go | 必需 | 流式聊天适配器 —— 三个隐藏工具，都不在会话的直接工具集中：`chat`（一次推理，`ev.llm.token` 增量，取消；`runner` 豁免，超时 `NIF_LLM_TIMEOUT_MS`）、`llm_resolve`（客户端调用的无凭据解析探针）和 `llm_models_source`（`models` 目录调用的 `x-models-source` v1 实时 id 源）—— 协议：OpenAI 兼容的 Chat Completions、OpenAI Codex（ChatGPT OAuth）Responses 和 Anthropic Messages；`components/llm-openai` 中的 `llm-openai` 是最小的非流式示例（它只读取 `NIF_OPENAI_API_KEY`、`NIF_OPENAI_BASE_URL`、`NIF_OPENAI_MODEL` 和 `NIF_OPENAI_CONTEXT` —— 不读取 `NIF_OPENAI_PROVIDER` —— 并且总是发送 `max_tokens: 32768`，一个没有旋钮的硬编码值）；通过 `manifest.yaml` 换入它 —— 在同一次编辑中注释掉 `llm`，因为 `chat` 是全局唯一的工具名，重复注册会被拒绝；`make build` 无论如何都会构建 `var/bin/llm-openai`。不要期望聊天契约之外的任何东西：没有 `ev.llm.token` 流式，没有取消，没有 `finish_reason`，没有 `llm_resolve`（core 在最后一个上优雅降级） |
+| `llm` | Go | 必需 | 流式聊天适配器 —— 三个隐藏工具，都不在会话的直接工具集中：`chat`（一次推理，`ev.llm.token` 增量，取消；`runner` 豁免，超时 `NIF_LLM_TIMEOUT_MS`）、`llm_resolve`（客户端调用的无凭据解析探针）和 `llm_models_source`（`models` 目录调用的 `x-models-source` v1 实时 id 源）—— 协议：OpenAI 兼容的 Chat Completions、API Key Responses、OpenAI Codex（ChatGPT OAuth）Responses 和 Anthropic Messages；`components/llm-openai` 中的 `llm-openai` 是最小的非流式示例（它只读取 `NIF_OPENAI_API_KEY`、`NIF_OPENAI_BASE_URL`、`NIF_OPENAI_MODEL` 和 `NIF_OPENAI_CONTEXT` —— 不读取 `NIF_OPENAI_PROVIDER` —— 并且总是发送 `max_tokens: 32768`，一个没有旋钮的硬编码值）；通过 `manifest.yaml` 换入它 —— 在同一次编辑中注释掉 `llm`，因为 `chat` 是全局唯一的工具名，重复注册会被拒绝；`make build` 无论如何都会构建 `var/bin/llm-openai`。不要期望聊天契约之外的任何东西：没有 `ev.llm.token` 流式，没有取消，没有 `finish_reason`，没有 `llm_resolve`（core 在最后一个上优雅降级） |
 | `models` | Go | 可选 | models.dev 提供商/模型目录、原子缓存、严格解析，以及插件纠正/发现层（见[模型目录](#model-catalog-models)） |
 | `provider` | Go | 可选 | 存储支持的 LLM 提供商注册表：`provider_add`/`list`/`switch`/`active`/`remove`/`export`/`import`，订阅 OAuth 登录（`provider_oauth_start`/`complete`/`cancel`），`ev.provider.switch` 通知 |
 | `plugins` | Nim | 可选 | 生态系统前门：主题搜索 + 包的安装/更新/移除 |
@@ -297,7 +297,8 @@ Niffler 没有单一配置文件。环境用于启动决策，存储文档和会
 | `NIF_GIT_MIRROR` | 当 `plugins` 组件克隆包时替换 `https://github.com` 的主机前缀（例如 `https://cnb.cool` 或 Gitee 镜像）——API/搜索端点仍留在 GitHub | 未设置 |
 | `NIF_NPM_REGISTRY` | `builder` ts 组件安装的 npm registry（例如 `https://registry.npmmirror.com`） | npm 默认 |
 | `NIF_OPENAI_API_KEY` | LLM 适配器（`llm`）的 API 密钥。任何对话轮次都需要；完全没有密钥时适配器在任何 HTTP 请求之前就拒绝（`provider "default": no API key (set NIF_OPENAI_API_KEY or NIF_LLM_PROVIDERS apiKey)`），这与密钥存在但被拒绝（HTTP 401/403）是不同的症状 | — |
-| `NIF_OPENAI_BASE_URL` | OpenAI 兼容端点 | `https://api.openai.com/v1` |
+| `NIF_OPENAI_BASE_URL` | 所选协议的基础 URL（不含 `/chat/completions` 或 `/responses`） | `https://api.openai.com/v1` |
+| `NIF_OPENAI_PROTOCOL` | 默认环境连接的协议：`openai-chat-completions`、`openai-responses` 或 `anthropic`；旧名 `openai-chat` 仍是 `openai-chat-completions` 的兼容别名。Responses 使用 `baseUrl + /responses` 和 Bearer API Key 认证；`openai-codex` 仍仅限 OAuth | `openai-chat-completions` |
 | `NIF_OPENAI_MODEL` | 模型名称 | `deepseek-chat` |
 | `NIF_OPENAI_PROVIDER` | 默认 LLM 连接的 models 目录 provider id；未设置时推断常见端点 | 推断 |
 | `NIF_OPENAI_CONTEXT` | llm 向 core 的上下文守卫报告的显式上下文窗口（token）。解析顺序：存储的 provider `context` → 此值 → `models` 目录 → `llm` 的内置表（`deepseek-chat`/`deepseek-reasoner` 1M，`syn:large:text` 524288，`zai-org/glm-5.3-flash` 524288——代码内置，因此新模型需要改源码）→ 128000（`llm-openai` 替换示例仅解析 `NIF_OPENAI_CONTEXT` → 一个两项的 `deepseek-chat`/`deepseek-reasoner` 表 → `128000`，并在每次调用时重新读取该变量） | `models` 目录，然后内置表，然后 `128000` |
@@ -305,7 +306,7 @@ Niffler 没有单一配置文件。环境用于启动决策，存储文档和会
 | `NIF_AGENT_DEFAULT_TIER` | 当父代理的确切模型不在配置的阶梯中时使用的层级上限（`weak`、`medium` 或 `strong`） | `strong` |
 | `NIF_AGENT_WAKES` | 后台子代理在对话空闲时结算后，对话可运行的连续自主唤醒轮次数（docs/WIRE.md "Autonomous wake"）；人类的下一条消息重置预算，`0` 禁用唤醒（通知随后等待下一轮次的拉取排空） | `3` |
 | `NIF_AGENT_NOTICE_HOLD` | `0` 允许轮次在其最后一步期间收到结算通知时仍关闭（通知等待下一轮次的排空）；默认情况下轮次被多保持一步，以免在刚完成的子代理之上关闭（docs/WIRE.md "Busy-parent inbox"） | `1` |
-| `NIF_LLM_PROVIDERS` | 命名 provider 的 JSON 对象 `{nickname: {baseUrl, apiKey, model, context, catalog, protocol?, authType?, accountId?, stripPrefix?}}`，由 `chat` 工具的 `provider` 参数解析。`protocol` 为 `openai-chat`（默认）、`anthropic` 或 `openai-codex`；`authType` 默认为 `api_key`；`stripPrefix` 为按规范 id 路由的网关重写带命名空间的 id（`alibaba/glm-5.2` → `glm-5.2`）；`accountId` 是 Codex 通道头部携带的 ChatGPT 账户 id，当记录未持有时从 OAuth token 推导（两者都没有时，调用失败并提示 `OpenAI Codex OAuth token has no ChatGPT account id; sign in again`）。格式错误的 JSON 和缺失的 `apiKey` 各自显式使调用失败。provider 注册表（`provider` 组件）激活时取代默认 | `{}` |
+| `NIF_LLM_PROVIDERS` | 命名 provider 的 JSON 对象 `{nickname: {baseUrl, apiKey, model, context, catalog, protocol?, authType?, accountId?, stripPrefix?}}`，由 `chat` 工具的 `provider` 参数解析。`protocol` 为 `openai-chat-completions`（默认；旧别名 `openai-chat`）、`openai-responses`、`anthropic` 或仅限 OAuth 的 `openai-codex`；`authType` 默认为 `api_key`；`stripPrefix` 为按规范 id 路由的网关重写带命名空间的 id（`alibaba/glm-5.2` → `glm-5.2`）；`accountId` 是 Codex 通道头部携带的 ChatGPT 账户 id，当记录未持有时从 OAuth token 推导（两者都没有时，调用失败并提示 `OpenAI Codex OAuth token has no ChatGPT account id; sign in again`）。格式错误的 JSON 和缺失的 `apiKey` 各自显式使调用失败。provider 注册表（`provider` 组件）激活时取代默认 | `{}` |
 | `NIF_MODELS_URL` | models.dev 兼容的目录基础或 JSON 端点 | `https://models.dev/api.json` |
 | `NIF_MODELS_PATH` | 固定的本地基线目录：设置期间，此文件*就是*基线——组件从不下载 `NIF_MODELS_URL`（即使 `models_refresh {force: true}` 也不），并在下次刷新时拾取文件更改。插件源和 `NIF_MODELS_OVERRIDE` 仍然适用 | 未设置 |
 | `NIF_MODELS_OVERRIDE` | 在每个插件源之后应用的本地 JSON Merge Patch | 未设置 |
@@ -991,7 +992,7 @@ models.dev 无法发现嵌入模型：它的 `modalities.output` 即使对 `text
 
 | Tool | What it does |
 |---|---|
-| `provider_add {nickname, apiKey, protocol?, baseUrl?, model?, embedModel?, embedBaseUrl?, catalog?, context?, plugin?, stripPrefix?, active?}` | 添加或覆盖一个 API-key provider（按昵称 upsert；`protocol`：默认 `openai-chat` 或 `anthropic`）；第一个 provider——API-key 或 OAuth——会自动变为活跃，除非 `active: false`；`stripPrefix` 会发送不带 `vendor/` 前缀的命名空间模型 id，用于按规范 id 路由的网关（例如 `alibaba/glm-5.2` 发送为 `glm-5.2`）；响应已脱敏 |
+| `provider_add {nickname, apiKey, protocol?, baseUrl?, model?, embedModel?, embedBaseUrl?, catalog?, context?, plugin?, stripPrefix?, active?}` | 添加或覆盖一个 API-key provider（按昵称 upsert；`protocol`：默认 `openai-chat-completions`、`openai-responses` 或 `anthropic`；兼容旧名 `openai-chat`）；第一个 provider——API-key 或 OAuth——会自动变为活跃，除非 `active: false`；`stripPrefix` 会发送不带 `vendor/` 前缀的命名空间模型 id，用于按规范 id 路由的网关（例如 `alibaba/glm-5.2` 发送为 `glm-5.2`）；响应已脱敏 |
 | `provider_update {nickname, apiKey?, protocol?, baseUrl?, model?, embedModel?, embedBaseUrl?, catalog?, context?, plugin?, stripPrefix?}` | 用于部分更新的隐藏客户端 API；省略的 API key 会被保留 |
 | `provider_oauth_start {protocol, method?, nickname?, model?, active?}` | 隐藏，开始订阅登录：`protocol` 为 `openai-codex`（ChatGPT Plus/Pro）或 `anthropic`（Claude Pro/Max）；`method` 为 `browser`（本地回调）或 `device`（无头，仅 OpenAI）。返回 `{flowId, url, userCode?, callbackAvailable, expiresAt}` |
 | `provider_oauth_complete {flowId, code?}` | 隐藏，轮询/完成登录；在回调（或粘贴的 `code`）到达之前返回 `{pending, retryAfterMs?}`，然后存储 provider 并以脱敏形式报告 |
@@ -1027,11 +1028,18 @@ models.dev 无法发现嵌入模型：它的 `modalities.output` 即使对 `text
 
 每个 provider 携带一个 `protocol`，`llm` 据此路由：
 
-- `openai-chat`——OpenAI 兼容的 Chat Completions 端点（默认；DeepSeek、OpenRouter、本地 vLLM……）。
+- `openai-chat-completions`——OpenAI 兼容的 Chat Completions 端点（默认；DeepSeek、OpenRouter、本地 vLLM……）；`openai-chat` 仍是兼容旧别名。
+- `openai-responses`——API Key Responses 端点（`baseUrl + /responses`），使用 `Authorization: Bearer <apiKey>`；支持自定义基础 URL。
 - `openai-codex`——ChatGPT 的 Codex Responses 端点（`https://chatgpt.com/backend-api/codex/responses`），带 ChatGPT OAuth 头（`chatgpt-account-id`、`OpenAI-Beta: responses=experimental`）；消息被转换为 Responses API 输入格式，SSE 事件流（文本/推理增量、函数调用）被映射回共享结果形态。
-- `anthropic`——Anthropic Messages 端点；OAuth 登录会发送 Claude Code 身份头和 betas，系统提示以 Claude Code 前言开头，工具调用/结果被转换为 `tool_use`/`tool_result` 块（连续的工具结果合并为一条 user 消息）；其用量为 core 的计数器归一化——`prompt_tokens` 是输入 + 缓存读取 + 缓存写入，而只有缓存**读取**计为缓存 token（缓存写入按写入费率计费）。在所有三种协议中，只有当 provider 报告非零 token 时，结果才会附带 `usage` 对象。
+- `anthropic`——Anthropic Messages 端点；OAuth 登录会发送 Claude Code 身份头和 betas，系统提示以 Claude Code 前言开头，工具调用/结果被转换为 `tool_use`/`tool_result` 块（连续的工具结果合并为一条 user 消息）；其用量为 core 的计数器归一化——`prompt_tokens` 是输入 + 缓存读取 + 缓存写入，而只有缓存**读取**计为缓存 token（缓存写入按写入费率计费）。在所有四种协议中，只有当 provider 报告非零 token 时，结果才会附带 `usage` 对象。
 
-API-key provider 只能使用 `openai-chat` 或 `anthropic`：`openai-codex` 需要 ChatGPT 订阅登录（`provider_oauth_start`），`provider_add` 拒绝该组合。
+API-key provider 可使用 `openai-chat-completions`、`openai-responses` 或 `anthropic`（也兼容旧名 `openai-chat`）：`openai-codex` 需要 ChatGPT 订阅登录（`provider_oauth_start`），`provider_add` 拒绝该组合。
+
+`NIF_LLM_PROVIDERS` 的每个条目单独选择 `protocol`，例如（仅含占位密钥）：
+
+```dotenv
+NIF_LLM_PROVIDERS={"chat":{"protocol":"openai-chat-completions","baseUrl":"https://api.openai.com/v1","apiKey":"sk-...","model":"gpt-5.4"},"responses":{"protocol":"openai-responses","baseUrl":"https://api.openai.com/v1","apiKey":"sk-...","model":"gpt-5.4"},"claude":{"protocol":"anthropic","baseUrl":"https://api.anthropic.com/v1","apiKey":"sk-ant-...","model":"claude-sonnet-4-6"}}
+```
 
 ### Output caps and `finish_reason`
 

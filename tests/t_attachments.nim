@@ -42,18 +42,33 @@ proc main() =
   # so the test can assert the wire shape (not just the bus reply).
   let portFile = sandbox.root / "var" / "fixture.port"
   let reqFile = sandbox.root / "var" / "fixture.requests"
-  let fixture = startProcess("python3", workingDir = repoRoot, args = @[
-    repoRoot / "tests" / "fixtures" / "openai_stream_server.py",
-    portFile, reqFile], options = {poUsePath, poParentStreams})
+  let fixtureLog = sandbox.root / "var" / "fixture.log"
+  let fixtureCmd = "exec python3 -u " & quoteShell(
+    repoRoot / "tests" / "fixtures" / "openai_stream_server.py") &
+    " " & quoteShell(portFile) & " " & quoteShell(reqFile) &
+    " > " & quoteShell(fixtureLog) & " 2>&1"
+  let fixture = startProcess("/bin/sh", workingDir = repoRoot,
+                            args = ["-c", fixtureCmd],
+                            options = {poParentStreams})
   defer: stopProcess(fixture)
   var port = ""
-  for i in 0 ..< 200:
+  let fixtureDeadline = epochTime() + 15.0
+  while epochTime() < fixtureDeadline:
+    if not fixture.running(): break
     if fileExists(portFile):
       port = readFile(portFile).strip()
       if port.len > 0: break
-    sleep(20)
-  check("OpenAI stream fixture starts", port.len > 0)
-  if port.len == 0: quit(1)
+    sleep(50)
+  let fixtureReady = port.len > 0 and fixture.running()
+  var fixtureDiagnostic = ""
+  if not fixtureReady:
+    fixtureDiagnostic = if fixture.running(): "startup timed out after 15s"
+                        else: "exited with code " & $fixture.peekExitCode()
+    fixtureDiagnostic.add("\nfixture log: " & fixtureLog & "\n")
+    fixtureDiagnostic.add(if fileExists(fixtureLog): readFile(fixtureLog)
+                          else: "(no output captured)")
+  check("OpenAI stream fixture starts", fixtureReady, fixtureDiagnostic)
+  if not fixtureReady: quit(1)
 
   let coreProc = startComponent(sandbox.sandboxBin("niffler"), url,
                                 root = sandbox.root, extra = [
