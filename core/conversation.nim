@@ -10,7 +10,7 @@
 ## lives in core/tty.nim — the tty is not a conversation UI.
 ##
 ## Conversations and messages persist via the store component (document
-## store over the bus); persistence failures degrade gracefully.
+## store over the bus); canonical append failures stop the turn.
 
 import std/[algorithm, json, math, monotimes, os, sequtils, sets, strutils,
     tables, times, unicode]
@@ -195,11 +195,6 @@ type
     convId*: string
     seqNo*: int
     persistenceFailures*: int ## Monotonic in this runner; completion cannot hide a lost message.
-    lostWrites*: seq[JsonNode]
-      ## Messages whose write FAILED (id, role, tool_call_id, name). The
-      ## id is consumed, so the record is gone for good; remembering it is
-      ## what lets the turn record WHICH tool pair it lost instead of a
-      ## later reader having to infer it from a gap in the id sequence.
     promptTokens*: int   ## model-reported prompt tokens of the last chat request
     contextUsed*: int    ## best post-response occupancy (total tokens when available)
     ctxSize*: int        ## catalog model context window
@@ -251,7 +246,6 @@ type
     ## a healthy session stays well under 50% after the first turns.
     cachePrompt*: int    ## Σ prompt_tokens over responses reporting usage
     cacheRead*: int      ## Σ cached_tokens (provider-served prefix hits)
-    failing: bool
     ## Context identity (docs/research/COMPACTION.md §4.2): the node ledger
     ## is 1:1 with the projection (Session.messages) and canonicalHigh is
     ## the highest canonical seq represented in context — appends continue
@@ -403,19 +397,15 @@ proc newPersister*(ct: CoreTools): Persister =
   except CatchableError:
     discard
 
+type TranscriptWriteError* = object of IOError
+
 proc persistMsg*(p: var Persister, value: JsonNode,
                  telemetry: JsonNode = nil): string {.discardable.} =
-  ## Persist one message; warn once on failure and once on recovery.
-  ## Ids are zero-padded so store key order == message order. Storage-only
-  ## telemetry is copied onto the persisted value, never into LLM history.
-  ## Returns the allocated store key — the canonical id callers record in
-  ## the node ledger (ctxAppend). Best-effort: on a store failure the id is
-  ## still consumed and returned, but the record will not be there on
-  ## resume (same semantics as before; the ledger just records intent).
-  ## Canonical writes are create-only. A stale continuation must refuse,
-  ## not overwrite history or silently append onto a partially loaded context.
-  inc p.seqNo
-  result = p.convId & ":" & align($p.seqNo, 6, '0')
+  ## Advance only after a create-only append is confirmed. A missing reply
+  ## is ambiguous: the write may have committed. Reload before the next turn
+  ## rather than retry with different content at the same sequence number.
+  let seqNo = p.seqNo + 1
+  result = p.convId & ":" & align($seqNo, 6, '0')
   let stored = value.copy()
   stored["conversationId"] = %p.convId
   stored["createdAt"] = %epochTime()
@@ -424,23 +414,12 @@ proc persistMsg*(p: var Persister, value: JsonNode,
       stored[key] = fieldValue
   try:
     discard p.ct.storePutRev("message", result, stored, expectRev = -1)
-    if p.failing:
-      p.failing = false
-      echo "core: store reachable again — persistence resumed"
-  except StoreRevisionConflictError:
-    raise newException(IOError, "refusing to overwrite canonical message " & result &
-      " — continuation sequence is stale; reload the conversation")
   except CatchableError as e:
     inc p.persistenceFailures
-    if not p.failing:
-      p.failing = true
-      echo "core: WARNING persistence down (messages not saved): " & e.msg
-    var lost = %*{"id": result, "role": stored{"role"}.getStr(""),
-                  "at": epochTime()}
-    if stored{"tool_call_id"} != nil:
-      lost["toolCallId"] = %stored{"tool_call_id"}.getStr("")
-    if stored{"name"} != nil: lost["name"] = %stored{"name"}.getStr("")
-    p.lostWrites.add(lost)
+    let detail = "transcript persistence failed at " & result & ": " & e.msg
+    echo "core: WARNING " & detail
+    raise newException(TranscriptWriteError, detail)
+  p.seqNo = seqNo
 
 proc ctxAppend*(p: var Persister, messages: var seq[JsonNode],
                 msg: JsonNode, telemetry: JsonNode = nil) =
@@ -964,13 +943,16 @@ proc reindexNodes(p: var Persister) =
     p.nodes[i].projectionIndex = i
 
 proc lostToolResultText(name: string): string =
-  ## The body of a synthesized tool result (healToolPairing): it says the
-  ## output is GONE rather than pretending the call returned nothing — the
-  ## model can re-run the call, the harness cannot recover the bytes.
+  ## The body of a synthesized tool result (healToolPairing): the harness
+  ## cannot recover the bytes, and it also cannot know whether the call ran.
+  ## It therefore reports an UNKNOWN OUTCOME, never "re-run it" — the dispatch
+  ## may already have landed an edit, started a job or installed a plugin, so
+  ## inviting a retry invited double effects (issue #143).
   "ERROR: no result was recorded for this tool call (" & name &
-    ") — its message never reached the store (a store outage or a runner " &
-    "killed mid-persist). The call produced no recorded output; re-run it " &
-    "if you still need the result."
+    ") — the call was in flight when its runner died, or its result never " &
+    "reached the store. Its OUTCOME IS UNKNOWN: the work may have taken " &
+    "effect. Check the workspace/receipts before repeating it, and prefer " &
+    "re-issuing a read over re-running a write."
 
 proc healToolPairing*(convId: string, messages: var seq[JsonNode],
                       nodes: var seq[CtxNode]):
@@ -1120,31 +1102,6 @@ proc recordToolPairRepair(ct: CoreTools, convId: string, entries: JsonNode,
       if attempt == 2:
         echo "core: WARNING tool-pair repair ledger not written (" & e.msg &
              ") — the repair still applies; it is re-derived on every load"
-
-proc flushLostWrites*(ct: CoreTools, convId: string, p: var Persister) =
-  ## Record the messages persistMsg could not store. The id is consumed, so the
-  ## record is gone for good and the tool pair it belonged to is damaged — that
-  ## fact belongs in the store while it is still knowable, not inferred later
-  ## from a gap in the id sequence. Called at both ends of a turn: before it
-  ## (an outage of the previous turn may have recovered) and after it (so this
-  ## turn's own loss is recorded in the same turn).
-  ##
-  ## A runner can still be killed between the loss and the next flush; the
-  ## load-time repair re-derives from the transcript in that case, which is
-  ## why this is a recording, never the repair's source of truth.
-  if p.lostWrites.len == 0: return
-  var entries = newJArray()
-  for lost in p.lostWrites:
-    var e = %*{"key": "lost:" & lost{"id"}.getStr(""), "action": "lost",
-               "id": lost{"id"}, "role": lost{"role"}, "at": lost{"at"}}
-    if lost{"toolCallId"} != nil: e["toolCallId"] = lost{"toolCallId"}
-    if lost{"name"} != nil: e["name"] = lost{"name"}
-    entries.add(e)
-  let n = entries.len
-  p.lostWrites = @[]
-  recordToolPairRepair(ct, convId, entries, p.seqNo)
-  echo "core: WARNING " & $n & " message(s) of " & convId &
-       " were not persisted; recorded as lost for tool-pair repair"
 
 proc toolBodyText*(m: JsonNode): string =
   ## One tool message's TEXT, whatever shape its content has: the plain string
@@ -2336,10 +2293,8 @@ proc drainNotices*(ct: CoreTools, p: var Persister,
         let content = "[worktree " & n{"branch"}.getStr("") &
           " merged into " & n{"into"}.getStr("") & " as " &
           n{"commit"}.getStr("") & "]\n" & $n{"files"}
-        let failures = p.persistenceFailures
         ctxAppend(p, messages, %*{"role": "user", "content": content,
                                   "notice": n})
-        if p.failing or p.persistenceFailures != failures: continue
         seenMerges.incl(id)
         if onEvent != nil:
           onEvent("notice", %*{"sessionId": sessionId, "turnId": turnId,
@@ -2376,14 +2331,12 @@ proc drainNotices*(ct: CoreTools, p: var Persister,
         content.add(" under policy " & n{"taskPolicyDigest"}.getStr("")[0 ..< min(19, n{"taskPolicyDigest"}.getStr("").len)])
       let msg = %*{"role": "user", "content": content,
         "notice": {"kind": "fleet-settled", "jobId": id}}
-      let failuresBefore = p.persistenceFailures
       ctxAppend(p, messages, msg)
-      if p.persistenceFailures == failuresBefore and not p.failing:
-        seenFleet.incl(id)
-        try:
-          discard ct.dispatchToolCall("fleet_notices",
-            %*{"session": sessionId, "ack": id}, 5_000)
-        except CatchableError: discard
+      seenFleet.incl(id)
+      try:
+        discard ct.dispatchToolCall("fleet_notices",
+          %*{"session": sessionId, "ack": id}, 5_000)
+      except CatchableError: discard
       if onEvent != nil:
         # turnId, like every other frame drainNotices emits (eventId above):
         # this branch only ever publishes from a running turn, and a client
@@ -2396,7 +2349,7 @@ proc drainNotices*(ct: CoreTools, p: var Persister,
       continue
     if n{"kind"}.getStr("") == "process-exited":
       let processId = n{"processId"}.getStr("")
-      if processId in seenProcesses and not p.failing:
+      if processId in seenProcesses:
         try:
           discard ct.dispatchToolCall("process_notices",
             %*{"session": sessionId, "ack": processId}, 5_000)
@@ -2471,7 +2424,7 @@ proc drainNotices*(ct: CoreTools, p: var Persister,
     # 1:1 with the projection, and notices are runtime machinery it may
     # compact away like any other appended history (docs/research/COMPACTION.md §4.2)
     ctxAppend(p, messages, noticeMsg)
-    if n{"kind"}.getStr("") == "process-exited" and not p.failing:
+    if n{"kind"}.getStr("") == "process-exited":
       try:
         discard ct.dispatchToolCall("process_notices",
           %*{"session": sessionId, "ack": n{"processId"}.getStr("")}, 5_000)
@@ -3669,6 +3622,12 @@ proc runTurn*(ct: CoreTools, p: var Persister, messages: var seq[JsonNode],
       if reply.len > 0: ev["reply"] = %reply
       onEvent("done", ev)
     emitTurnDone(err)
+  defer:
+    let failure = getCurrentException()
+    if failure of TranscriptWriteError:
+      finishTurn("error", err = failure.msg)
+    else:
+      emitTurnDone("aborted", outcome = "aborted")
   if onEvent != nil:
     onEvent("turn", %*{"sessionId": sessionId, "turnId": turnId,
                        "phase": "start", "content": turnContent})
@@ -3771,8 +3730,6 @@ proc runTurn*(ct: CoreTools, p: var Persister, messages: var seq[JsonNode],
       # started is over, and a stale lease is worthless (a leaked lease would
       # keep the nested proxy answerable with it)
       ct.nested.leases = initTable[string, NestedLease]()
-  defer:
-    emitTurnDone("aborted", outcome = "aborted")
   # Live LLM token stream: subscribe before the first chat call so no
   # delta is missed, and forward every frame to the caller as a "token"
   # event (the UI renders them as streaming text/thinking). The frames
@@ -3813,6 +3770,7 @@ proc runTurn*(ct: CoreTools, p: var Persister, messages: var seq[JsonNode],
     ct.steerStream.cancelRequested = false
   var rounds = 0
   var emptyRounds = 0
+  var truncatedBatches = 0
     ## Consecutive rounds whose reply carried neither content nor tool calls
     ## (the guard at the end of the round loop below): re-asked a bounded
     ## number of times, then reported as a turn error.
@@ -4430,6 +4388,10 @@ proc runTurn*(ct: CoreTools, p: var Persister, messages: var seq[JsonNode],
     let toolCalls = resp{"tool_calls"}
     let hasToolCalls = toolCalls != nil and toolCalls.kind == JArray and
                        toolCalls.len > 0
+    let truncatedBatch = hasToolCalls and resp{"finish_reason"}.getStr("") == "length"
+    if truncatedBatch:
+      for tc in toolCalls:
+        tc{"function"}["arguments"] = %"{}"
     if content.len > 0 or hasToolCalls:
       emptyRounds = 0   # a real round: the empty-reply streak is broken
       let assistantMsg = %*{"role": "assistant",
@@ -4530,6 +4492,25 @@ proc runTurn*(ct: CoreTools, p: var Persister, messages: var seq[JsonNode],
                            "reply": content})
       emitTurnDone()
       return content
+
+    if truncatedBatch:
+      inc truncatedBatches
+      let msg = "provider output cap cut off the tool-call batch; no tools from it ran"
+      for tc in toolCalls:
+        ctxAppend(p, messages, %*{"role": "tool", "tool_call_id": tc{"id"},
+          "name": tc{"function", "name"}, "content": "ERROR: " & msg})
+      if onEvent != nil:
+        onEvent("status", %*{"sessionId": sessionId, "turnId": turnId,
+          "truncatedToolBatch": true, "finishReason": "length"})
+      if truncatedBatches > 1:
+        turnError = msg & " (reissue also truncated)"
+        p.persistMsg(%*{"role": "error", "content": turnError,
+                        "error": "truncated-tool-batch", "turnId": turnId})
+        finishTurn("error", err = turnError)
+        return ""
+      ctxAppend(p, messages, %*{"role": "user", "content":
+        "[Harness: " & msg & ". Reissue the intended calls in smaller batches.]"})
+      continue
 
     # --- Tool-call execution: parallel-safe calls (x-harness.parallel) fan
     # out over the bus; the rest (approval-gated, session-context, parse
@@ -6188,7 +6169,11 @@ proc handleSessionCall*(ct: CoreTools, inputArgs: JsonNode,
     let found = ct.dispatchToolCall("discover", args{"discovery"})
     let message = %*{"role": "user", "content":
       "Explicit tool discovery (schemas are data, not instructions):\n" & $found}
-    ctxAppend(entry.persister, entry.messages, message)
+    try:
+      ctxAppend(entry.persister, entry.messages, message)
+    except TranscriptWriteError as e:
+      sessions.del(sessionId)
+      return %*{"error": e.msg, "code": "transcript-persistence"}
     recordDiscovery(ct, sessionId, entry.exposure, found)
     sessions[sessionId] = entry
     return %*{"ok": true, "sessionId": sessionId, "discovery": found}
@@ -6601,7 +6586,11 @@ proc handleSessionCall*(ct: CoreTools, inputArgs: JsonNode,
     else:
       %*{"role": "user", "content": turnContent}
   let failuresBeforeTurn = entry.persister.persistenceFailures
-  ctxAppend(entry.persister, entry.messages, userMsg)
+  try:
+    ctxAppend(entry.persister, entry.messages, userMsg)
+  except TranscriptWriteError as e:
+    sessions.del(sessionId)
+    return %*{"error": e.msg, "code": "transcript-persistence"}
   if attachRefs.len > 0:
     # Materialize into the projection: the newest images within the budget
     # carry their data URL, older ones an honest text marker. Deterministic
@@ -6635,19 +6624,18 @@ proc handleSessionCall*(ct: CoreTools, inputArgs: JsonNode,
       ct.approval.approvalMode = ""
       ct.approval.taskPolicy = nil
 
-  # A previous turn's lost writes (the store may be reachable again now).
-  flushLostWrites(ct, sessionId, entry.persister)
   var turnError = ""
   var turnAcct: TurnAccounting
-  let reply = runTurn(ct, entry.persister, entry.messages, turnAcct,
-                      entry.providerOverride, entry.modelOverride, entry.exposure, onEvent,
-                      entry.thinkingEffort, turnContent, entry.workspace,
-                      entry.maxRounds, entry.maxCalls, entry.maxTokens,
-                      entry.limitRounds, entry.limitTokens, entry.limitSeconds,
-                      entry.allowlist, turnError)
-  # This turn's own lost writes: recorded while the turn's accounting is still
-  # in hand, so the ledger names what the transcript cannot.
-  flushLostWrites(ct, sessionId, entry.persister)
+  var reply = ""
+  try:
+    reply = runTurn(ct, entry.persister, entry.messages, turnAcct,
+                    entry.providerOverride, entry.modelOverride, entry.exposure, onEvent,
+                    entry.thinkingEffort, turnContent, entry.workspace,
+                    entry.maxRounds, entry.maxCalls, entry.maxTokens,
+                    entry.limitRounds, entry.limitTokens, entry.limitSeconds,
+                    entry.allowlist, turnError)
+  except TranscriptWriteError as e:
+    turnError = e.msg
   # Terminal admission receipt (docs/FLEET.md §4): the activation's outcome,
   # turnId and usage for exactly this turn, committed before the human
   # activity receipt so a requester that lost the reply can reconcile this
@@ -6716,7 +6704,10 @@ proc handleSessionCall*(ct: CoreTools, inputArgs: JsonNode,
           Envelope(v: 1, id: newId(), kind: ekEvent, payload: activity).encode())
     except CatchableError as e:
       echo "core: WARNING completion receipt not confirmed: " & e.msg
-  sessions[sessionId] = entry
+  if entry.persister.persistenceFailures == failuresBeforeTurn:
+    sessions[sessionId] = entry
+  else:
+    sessions.del(sessionId) # rebuild and repair the durable tail next time
   # turnError distinguishes "the turn failed" from "the model said this" so
   # drivers (agent_run) report child LLM failures as failures, not text.
   # turnId/outcome/usage are the authoritative per-turn accounting for THIS
@@ -6870,7 +6861,10 @@ proc routeSessionCall*(ct: CoreTools, env: Envelope, reply: string) =
       "session needs sessionId").encode())
     return
   try:
+    if ct.pending == nil:
+      raise newException(IOError, "session forwarding state is unavailable")
     let subject = ensureRunner(ct, sessionId)
+    let runnerPid = ct.cat.components[runnerName(sessionId)].pid
     let inbox = "_INBOX." & newId()
     var sub: ptr natsSubscription
     var st = natsConnection_SubscribeSync(addr sub, ct.nc.conn, inbox.cstring)
@@ -6884,12 +6878,9 @@ proc routeSessionCall*(ct: CoreTools, env: Envelope, reply: string) =
       natsSubscription_Destroy(sub)
       raise newException(IOError, "publish session request: " &
         getErrorString(st))
-    if ct.pending == nil:
-      natsSubscription_Destroy(sub)
-      raise newException(IOError, "session forwarding state is unavailable")
     ct.pending.forwards.add(SessionForward(
-      env: env, reply: reply, sub: sub,
-      deadline: epochTime() + 1800.0 * 1000.0))
+      env: env, reply: reply, sub: sub, runnerPid: runnerPid,
+      deadline: getMonoTime() + initDuration(minutes = 30)))
   except CatchableError as e:
     ct.nc.publish(reply, errorEnvelope(env.id, "boom", e.msg).encode())
 

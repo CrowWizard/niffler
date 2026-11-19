@@ -527,6 +527,20 @@ Rules:
 
 ## Subjects
 
+## Harness home trust
+
+Boot executes two kinds of checkout-owned code: `autostart` manifest
+components and persisted spawn records. A home that has never run (no
+`var/store.db`/`var/logs`), has no `var/home-trust` marker and is given no
+`NIF_TRUST` starts only the core-owned bootstrap set — `store`, `bash`,
+`builder`, `llm`, `systemprompt` — and logs each component it skipped. The set
+is a CORE constant, deliberately not the manifest's own `required` flag (a
+foreign manifest could set that). `NIF_TRUST=always` restores full autostart;
+`never` refuses; `ask` prompts only with a tty and refuses otherwise. This is
+not a subscription or envelope contract — nothing on the bus changes — and it
+is not a sandbox: it gates whether a checkout's code STARTS on first open.
+
+
 Both shipped store engines request `reg.admit` before subscribing to
 `svc.store.call`, on initial connection and full re-attachment. Core atomically
 reserves the registration before replying; a second store PID is refused even
@@ -964,7 +978,10 @@ calling `core.spawn`) are served from the dispatch's idle slot, and
 `session` calls never block core — each rides its private forwarding inbox
 (`routeSessionCall`) and is completed by `pumpSessionForwards`, so separate
 conversations' turns overlap while a mid-turn conversation refuses further
-turns with `busy` — turns never nest.
+turns with `busy` — turns never nest. A forward returns `session-runner-exited`
+if its runner dies without replying, or `session-forward-timeout` after 30
+minutes. Neither is a cancellation or a guarantee that no effects landed;
+clients must not automatically resubmit the turn.
 
 - Presence = connection; component death detected by core via NATS disconnect
   plus `reg.depart` (graceful) vs silence (crash). A Nim or Go SDK component
@@ -2151,10 +2168,15 @@ Strict providers re-validate tool-call pairing on **every** request: each entry
 of an assistant message's `tool_calls` must be answered by a `tool` message
 carrying that `tool_call_id`, and every `tool` message must answer a call that
 is pending. A transcript can lose that shape with nobody editing it — a
-message write is best-effort (an outage consumes the id and drops the record),
-a runner can be killed mid-batch, a fork copies whatever the store holds — and
+legacy runners could skip failed message writes, a runner can be killed
+mid-batch, or a fork can copy damaged history — and
 the damage is then **permanent**: every later request re-sends the same prefix
 and is refused identically, so the conversation can never run again.
+
+Canonical appends are create-only and ordered. If the store does not confirm
+an append, the turn stops with an explicit persistence error; the runner
+reloads the durable transcript before another turn. It does not assume a
+missing acknowledgement means the write did not commit.
 
 Because of that the runner repairs the **projection** when it loads one
 (`healToolPairing`, once per load, not per round):

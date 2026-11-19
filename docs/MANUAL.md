@@ -246,11 +246,16 @@ directory fails the call instead of running somewhere else.
 Commands optionally run inside a sandbox (the SDK's `netScoped` wrapper,
 `sdk/niffler/procutil.nim`). With `NIF_BASH_SANDBOX_MAP` set, every command —
 `run_in_background` included — runs as a fresh `docker run --rm --network none`
-of the image whose entry is the longest matching prefix of the command's `cwd`,
-with only that workspace root bind-mounted at the same path: the image's
-toolchains, the workspace, and nothing else on the host, so held-out material
-and other checkouts are unreachable by construction, and container state beyond
-the workspace does not persist between calls. `NIF_BASH_NET=off` is the
+of the image whose entry is the longest matching prefix of the command's `cwd`
+(entries and `cwd` are compared on resolved real paths, so a symlinked spelling
+still matches), with only that workspace root bind-mounted at the same path: the
+image's toolchains, the workspace, and nothing else on the host, so held-out
+material and other checkouts are unreachable by construction, and container
+state beyond the workspace does not persist between calls.
+`NIF_BASH_CONTAINER_MAP` names a **persistent** offline container per task root
+instead: commands run there via `docker exec` as the host UID/GID, so `/tmp`,
+caches and background services survive between calls, and a matched root with no
+container entry refuses (exit 125). `NIF_BASH_NET=off` is the
 lightweight variant — a host `unshare` netns (loopback only). A `cwd` with no
 map entry, and the netns variant on a host that forbids unprivileged user
 namespaces, fail the call loudly (exit 125) rather than run unsandboxed.
@@ -676,7 +681,8 @@ see [The `.env` file](#the-env-file)) and inherit core's environment. `NIF_BIN_D
 | Variable | Meaning | Default |
 |---|---|---|
 | `NIF_ROOT` | the harness root (repo). Core derives it from its binary location if unset, and sets it for all children. Components use it to find the SDK, `var/`, `.env`. Every component runs with **cwd = NIF_ROOT**, so the agent's `bash pwd` is always the home — regardless of where you launched the harness | `<binary location>/../..` |
-| `NIF_BASH_SANDBOX_MAP` | `<absolute-dir>=<image>` lines (longest matching prefix of the command's `cwd` wins) that make the `bash` tool run every command — foreground and `run_in_background` alike — as `docker run --rm --network none` with only that workspace root bind-mounted at the same path (the image's toolchains and caches, the workspace, and nothing else). Written by hosted-benchmark lanes (the DeepSWE port); a `cwd` that matches no entry fails the call loudly (exit 125) rather than running unsandboxed. Takes precedence over `NIF_BASH_NET` | unset |
+| `NIF_BASH_SANDBOX_MAP` | `<absolute-dir>=<image>` lines (longest matching prefix of the command's `cwd` wins; entries and `cwd` are compared on resolved real paths, so a symlinked spelling still matches) that make the `bash` tool run every command — foreground and `run_in_background` alike — as `docker run --rm --network none` with only that workspace root bind-mounted at the same path (the image's toolchains and caches, the workspace, and nothing else). Written by hosted-benchmark lanes (the DeepSWE port); a `cwd` that matches no entry fails the call loudly (exit 125) rather than running unsandboxed. Takes precedence over `NIF_BASH_NET` | unset |
+| `NIF_BASH_CONTAINER_MAP` | `<absolute-dir>=<container>` lines that, with `NIF_BASH_SANDBOX_MAP`, run matching commands in a **persistent** offline container instead of a fresh `docker run --rm` per command: `docker exec --user <host-uid>:<host-gid>` with `HOME=/root` and the matched workspace as the working directory, so `/tmp`, caches, background services and host-side edit/git ownership survive between calls. A matched sandbox root with no container entry refuses (exit 125) rather than falling back to the host. Written by hosted-benchmark lanes; ignored without `NIF_BASH_SANDBOX_MAP` | unset |
 | `NIF_SANDBOX_STRICT` | `1` makes an operator-env guard (`NIF_BASH_SANDBOX=on`) launch with **strict** reach — the host root is not mounted, so reads reach only the workspace, approved roots and a reviewed runtime set — instead of the default `compat` (writes confined, host readable). A conversation whose own sandbox policy is enabled always asks for strict. A strict launch **refuses** rather than degrading to Landlock (writes-only, reads unconfined); `NIF_SANDBOX_ALLOW_DEGRADED=1` still permits that degradation for a compat launch only. `make doctor` reports which backend a host can actually provide | unset (compat) |
 | `NIF_BASH_SANDBOX` | `on` runs every **foreground** `bash` command through the `niffler-sandbox` launcher (see [Shell guard and read masks](#shell-guard-and-read-masks)): workspace writable at its own path, the rest of the host bind-mounted read-only, private `/tmp`, fresh `/proc`, no network and no bus. `off` (the default) is unguarded. Any other value refuses. The workspace comes from the runner's session context, else `NIF_BASH_SANDBOX_ROOT`; a guarded `run_in_background` call is refused rather than run unguarded, and the guard cannot be combined with `NIF_BASH_SANDBOX_MAP` | `off` |
 | `NIF_BASH_SANDBOX_ROOT` | workspace path for a guarded command that has **no** session context (a bare `cli` call). A conversation turn supplies the workspace itself, so this is only for direct bus calls | unset |
@@ -790,6 +796,7 @@ see [The `.env` file](#the-env-file)) and inherit core's environment. `NIF_BIN_D
 | `NIF_LOG_RETENTION_DAYS` | days core retains child logs before sweeping | `7` |
 | `NIF_LOG_ROTATE_MB` | per-file rotation threshold for `var/logs`, checked at boot and hourly; oversized files rotate to `<name>.log.1` (one generation kept), so this is not a hard instantaneous cap | `5` |
 | `NIF_SPAWN_WAIT_MS` | how long `core.spawn` waits for the new component to register in the catalog before failing the call (clamped 250–120000); the wait ends early when the catalog records a refusal, so the knob only bounds a silent component | `5000` |
+| `NIF_TRUST` | whether this harness home may run code the checkout carries: `always` trusts it, `never` refuses, `ask` prompts on a tty (and refuses otherwise). Unset falls back to `var/home-trust` (a human's recorded answer) and then to "untrusted" — but a home that has already run (`var/store.db` + `var/logs`) stays trusted so an upgrade cannot disable a working installation. An untrusted home still boots and is inspectable; only NON-bootstrap manifest autostart components and persisted spawn records are skipped, and the boot log names each one | unset |
 
 **Build and script knobs** — read by the scripts around the harness, never by
 components: `NIF_BIN_DIR` (bin directory `scripts/install.sh` links the PATH
@@ -2252,6 +2259,11 @@ reports `finish_reason` loses both signals — no truncation warning, and an emp
 completion cut at the cap retried as an ordinary empty reply instead of ending
 the turn with `the provider cut the reply at the output cap before any
 content`; the `llm-openai` example returns none.
+
+When `length` accompanies tool calls, core dispatches none of the batch. It
+records a failure for every call and gives the model one chance to reissue
+the calls in smaller batches. A second truncated batch ends the turn with an
+error.
 
 ### Subscription OAuth (ChatGPT Plus/Pro, Claude Pro/Max)
 

@@ -77,6 +77,18 @@ OS-level sandboxing; see [Worktrees](docs/MANUAL.md#worktrees) and
 
 ### Added
 
+- **A foreign harness home no longer runs checkout code unasked.** Cloning a
+  repo and opening it with any UI used to autostart that manifest's components
+  and restore its persisted spawn records before any tool call — the same
+  execution `plugin_install` and `mcp_add` already gate. Boot now consults
+  `NIF_TRUST` (`always`/`never`/`ask`) and the recorded `var/home-trust`
+  marker; an untrusted home still starts, and is fully inspectable, but only
+  the core-owned bootstrap set (`store`, `bash`, `builder`, `llm`,
+  `systemprompt`) runs and the boot log names each skipped component. A home
+  that has already run keeps working, so upgrading never disables an existing
+  installation. This is a first-open boundary, not a sandbox: `make build`
+  still compiles the checkout, and a prebuilt binary is trusted once started.
+
 - **Long-term memory, scoped per repository** (`components/memory`, optional):
   durable facts a conversation chooses to keep, so a later conversation in the
   same repo does not rediscover them. The scope key is the repository's
@@ -150,6 +162,13 @@ OS-level sandboxing; see [Worktrees](docs/MANUAL.md#worktrees) and
   merge — and refuses to run against a core older than the source (exit 3).
   `docs/WORKTREES-ACCEPTANCE.md` documents the scripted run, the six-step human
   run for the client surface, and what each failure means.
+- **The DeepSWE bench lanes use one persistent offline container per live
+  cell.** `NIF_BASH_CONTAINER_MAP` maps a prepared workspace root to its
+  container, so matching commands run via `docker exec` as the host UID/GID
+  instead of a fresh `docker run --rm` per call: `/tmp`, caches and background
+  services survive between commands, and host-side edit and git ownership are
+  preserved. A matched root with no container entry refuses (exit 125). Both
+  Niffler and Pi use the same exec transport.
 
 ### Changed
 
@@ -190,6 +209,17 @@ OS-level sandboxing; see [Worktrees](docs/MANUAL.md#worktrees) and
   names DeepSeek Harness and Droid.
 
 ### Fixed
+
+- A tool result lost with its runner no longer tells the model to "re-run it".
+  The dispatch may already have taken effect, so the synthesized result now
+  reports an unknown outcome and asks for verification, preferring a re-read
+  over re-running a write.
+
+- A failed transcript append stops the turn. The runner reloads committed
+  history before accepting another turn rather than skipping the missing write.
+
+- Core refuses to execute tool batches cut off by the model’s output cap and
+  lets the model reissue the intended calls once.
 
 - Core timestamps its lifecycle logs and checks `var/logs` at boot and hourly
   for oversized files, retaining one rotated generation. `NIF_LOG_ROTATE_MB`
@@ -264,6 +294,20 @@ OS-level sandboxing; see [Worktrees](docs/MANUAL.md#worktrees) and
   automatically discovered roots, not `/roots add` grants, with the
   conversation's own tree first; `session_info.workspace.writable` uses the same
   rule as the write fence.
+- **Sandbox authority checks and the benchmark sandbox map compare resolved
+  real paths, not spellings.** A workspace reached through a symlink that
+  resolves outside an approved write root is refused, and the map matches an
+  entry and a `cwd` that name the same directory differently (a symlinked or
+  `/./`-laden spelling used to fail every command with exit 125). A path whose
+  tail does not exist yet is compared through its deepest existing ancestor
+  instead of raising an unhandled OS error.
+- **A catalog registration with no live process is no longer treated as a ready
+  runner.** A component killed without `reg.depart` leaves its registration
+  behind; core now drops a pid the kernel reports dead, announces the departure
+  to peers, and probes liveness at every `ensureRunner` site, so the next
+  session call spawns a replacement instead of publishing turns into a subject
+  with no subscriber and hanging with no error. A registration naming no pid
+  counts as unknown, never dead.
 
 ## [0.5.0] — 2026-10-29
 

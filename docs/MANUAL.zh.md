@@ -278,7 +278,8 @@ Niffler 没有单一配置文件。环境用于启动决策，存储文档和会
 | Variable | Meaning | Default |
 |---|---|---|
 | `NIF_ROOT` | harness 根目录（仓库）。未设置时 core 从其二进制位置推导，并为所有子进程设置它。组件用它来查找 SDK、`var/`、`.env`。每个组件都以 **cwd = NIF_ROOT** 运行，因此 agent 的 `bash pwd` 始终是 home——无论你从哪里启动 harness | `<binary location>/../..` |
-| `NIF_BASH_SANDBOX_MAP` | `<absolute-dir>=<image>` 行（按命令 `cwd` 的最长匹配前缀生效），让 `bash` 工具把每条命令——前台与 `run_in_background` 都一样——作为 `docker run --rm --network none` 运行，只把该工作区根绑定挂载到同一路径（镜像的工具链与缓存、工作区，别无一物）。由托管基准测试泳道写入（DeepSWE 移植）；`cwd` 匹配不到任何条目时调用会大声失败（exit 125），而不是无沙箱运行。优先于 `NIF_BASH_NET` | 未设置 |
+| `NIF_BASH_SANDBOX_MAP` | `<absolute-dir>=<image>` 行（按命令 `cwd` 的最长匹配前缀生效；条目与 `cwd` 以解析后的真实路径比较，因此符号链接拼写也能匹配），让 `bash` 工具把每条命令——前台与 `run_in_background` 都一样——作为 `docker run --rm --network none` 运行，只把该工作区根绑定挂载到同一路径（镜像的工具链与缓存、工作区，别无一物）。由托管基准测试泳道写入（DeepSWE 移植）；`cwd` 匹配不到任何条目时调用会大声失败（exit 125），而不是无沙箱运行。优先于 `NIF_BASH_NET` | 未设置 |
+| `NIF_BASH_CONTAINER_MAP` | `<absolute-dir>=<container>` 行，与 `NIF_BASH_SANDBOX_MAP` 一起让匹配的命令在一个**持久**的离线容器中运行，而不是每条命令都 `docker run --rm`：以 `docker exec --user <主机uid>:<主机gid>`、`HOME=/root`、匹配到的工作区为工作目录执行，因此 `/tmp`、缓存、后台服务与主机侧的编辑/git 所有权在调用之间保留。匹配到的沙箱根没有容器条目时拒绝（exit 125），而不是回退到主机。由托管基准测试泳道写入；未设置 `NIF_BASH_SANDBOX_MAP` 时忽略 | 未设置 |
 | `NIF_BASH_SANDBOX` | `on` 让每条**前台** `bash` 命令都经过 `niffler-sandbox` 启动器（见[Shell guard and read masks](#shell-guard-and-read-masks)）：工作区在自己的路径上可写，主机其余部分以只读方式绑定挂载，`/tmp` 私有、`/proc` 全新，无网络、无总线。`off`（默认）表示不启用守护。其他任何值都会拒绝。工作区来自 runner 的会话上下文，否则用 `NIF_BASH_SANDBOX_ROOT`；被守护的 `run_in_background` 调用会被拒绝，而不是无守护运行；该守护也不能与 `NIF_BASH_SANDBOX_MAP` 组合使用 | `off` |
 | `NIF_BASH_SANDBOX_ROOT` | 给**没有**会话上下文的受守护命令（裸 `cli` 调用）用的工作区路径。对话回合自己会提供工作区，所以这只用于直接的总线调用 | 未设置 |
 | `NIF_BASH_SANDBOX_MASKS` | 由运维管理的精确路径，每行一个（绝对路径，或相对工作区），对读**与**写都隐藏：`read`、`grep`/`files`、`repomap` 和技能资源都会拒绝它们，符号链接与硬链接别名同样被拒绝，shell 守护会在每个路径上绑定 `/dev/null`，使受守护的命令也无法读取。无论是否启用 shell 守护都生效。掩码就是掩码，不是机密性边界：它移除本来会被返回的内容，但无法隐藏躲在未声明路径后面的同一批字节，也无法隐藏配置之前已经取走的副本。配置了但不存在的路径会被拒绝，而不是悄悄放弃保护 | 未设置 |
@@ -1047,6 +1048,8 @@ NIF_LLM_PROVIDERS={"chat":{"protocol":"openai-chat-completions","baseUrl":"https
 ### Output caps and `finish_reason`
 
 输出上限按协议拼写，拼错的上限会静默失败。Niffler 的默认拼写是 `max_completion_tokens`；DeepSeek 只认 `max_tokens`，因此以默认方式发送的上限会被忽略，服务器自己的默认值（按模型为 8K/64K/128K）生效——对 DeepSeek 端点请发送 `max_tokens`。Anthropic 通道始终以 `max_tokens` 接收解析后的窗口；Codex 通道则完全不被告知上限。流的结束方式在 `finish_reason` 中报告：`length` 表示输出上限截断了回复（`llm` 会记录截断警告），`tool_calls` 表示模型停下来调用工具，Anthropic 的 `max_tokens` 停止映射为 `length`（其 `tool_use` 停止映射为 `tool_calls`）；Codex 的 `max_output_tokens` 结束及其 `response.incomplete` 事件也映射为 `length`，而无法识别的原因会原样传递以供日志记录。两个 OpenAI 兼容的错误结束，`aborted` 和 `insufficient_system_resource`，以 HTTP 200 到达，并作为可重试的流错误呈现，而不是作为回复。一个从不报告 `finish_reason` 的适配器会丢失这两个信号——没有截断警告，而在上限处被截断的空补全会作为普通空回复重试，而不是以 `the provider cut the reply at the output cap before any content` 结束该轮；`llm-openai` 示例不返回任何内容。
+
+若 `length` 同时带有工具调用，core 不执行这批调用。它为每个调用记录错误，并允许模型将调用拆成更小的批次重发一次。再次截断会以错误结束本轮。
 
 ### Subscription OAuth (ChatGPT Plus/Pro, Claude Pro/Max)
 

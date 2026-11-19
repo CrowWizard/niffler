@@ -9,6 +9,7 @@
 ## persisted children.
 
 import std/[json, os, osproc, streams, strutils, times]
+from std/posix import Pid, kill, SIGKILL
 import natsnim
 import envelope
 import helpers
@@ -587,6 +588,47 @@ proc main() =
     sleep(100)
   check("slow session caller eventually completes", not slowProc.running())
 
+  # Lose a specific runner after a turn has started, not before dispatch.
+  const crashSession = "agent-crash-core-regression"
+  let crashCall = callEnvelope("session",
+    %*{"sessionId": crashSession, "content": "SLOW_CHILD"})
+  let crashInbox = "_INBOX.core-crash-" & newId()
+  var crashSub: ptr natsSubscription
+  doAssert natsConnection_SubscribeSync(addr crashSub, nc.conn,
+    crashInbox.cstring) == NATS_OK
+  defer: natsSubscription_Destroy(crashSub)
+  let crashWire = crashCall.encode()
+  doAssert natsConnection_PublishRequest(nc.conn, "svc.core.call".cstring,
+    crashInbox.cstring, crashWire.cstring, crashWire.len.cint) == NATS_OK
+  var crashStarted = false
+  let crashDeadline = epochTime() + 10.0
+  while epochTime() < crashDeadline:
+    var msg: ptr natsMsg
+    if natsSubscription_NextMsg(addr msg, turnSub, 200) != NATS_OK: continue
+    let event = decode($natsMsg_GetData(msg))
+    natsMsg_Destroy(msg)
+    if event.payload{"sessionId"}.getStr("") == crashSession and
+        event.payload{"phase"}.getStr("") == "start":
+      crashStarted = true
+      break
+  let crashPids = runnerPids("session-" & crashSession)
+  check("crash test found the active runner", crashStarted and crashPids.len == 1)
+  if crashStarted and crashPids.len == 1 and crashPids[0] > 0:
+    check("kill the active runner", kill(Pid(crashPids[0]), SIGKILL) == 0)
+    var msg: ptr natsMsg
+    let st = natsSubscription_NextMsg(addr msg, crashSub, 3_000)
+    check("the abandoned forward completes promptly", st == NATS_OK, $st)
+    if st == NATS_OK:
+      let response = decode($natsMsg_GetData(msg))
+      natsMsg_Destroy(msg)
+      check("runner loss reports an unknown outcome on the original request",
+        response.id == crashCall.id and response.kind == ekError and
+        response.error{"code"}.getStr("") == "session-runner-exited", $response.error)
+    let replacement = call(nc, "core", "session", %*{"sessionId": crashSession}, 10_000)
+    check("a replacement runner serves new requests for the same conversation",
+      replacement{"sessionId"}.getStr("") == crashSession and
+      runnerPids("session-" & crashSession) != crashPids, $replacement)
+
   let liveTurn = call(nc, "core", "session",
                       %*{"sessionId": "si-live", "content": "go"}, 120_000)
   check("stub-LLM turn completed",
@@ -763,6 +805,92 @@ proc main() =
                        %*{"kind": "component", "id": "plugins"})
   check("--minimal leaves skipped component records intact",
         persisted{"ok"}.getBool(false), $persisted)
+
+  # --- an untrusted harness home does not run checkout code ----------------
+  # A fresh clone is untrusted until a human says otherwise: boot must not
+  # autostart manifest components outside the core-owned bootstrap set, and
+  # must not restore spawn records a previous conversation left behind — both
+  # are code from the checkout, and `plugin_install`/`mcp_add` already sit
+  # behind an approval. NIF_TRUST is the headless spelling of that decision.
+  block:
+    let untrusted = newCoreSandbox("untrusted-home",
+                                   ["store", "bash", "builder", "plugins", "llm"])
+    defer: removeDir(untrusted.root)
+    let (bus, busUrl) = startNats()
+    defer: stopServer(bus)
+    var client = waitConnect(busUrl)
+    defer: client.close()
+
+    # A spawn record the home carries, which an untrusted boot must not run.
+    # Seeded through the fault/diagnostic store (var/docs.json) rather than the
+    # sqlite engine: a real var/store.db would be evidence the home has run
+    # before, which is the case the gate deliberately does NOT cover.
+    copyFileWithPermissions(repoRoot / "var" / "bin" / "fixture-fleet-fault-store",
+                            untrusted.sandboxBin("store-sqlite"))
+    let seed = startComponent(untrusted.sandboxStoreBin(), busUrl,
+                              root = untrusted.root)
+    var recorded = false
+    for i in 0 ..< 100:
+      let r = call(client, "store", "put", %*{
+        "kind": "component", "id": "plugins",
+        "value": {"name": "plugins",
+                  "binary": untrusted.sandboxBin("plugins"),
+                  "policy": "on-failure"}}, 3_000)
+      if r{"ok"}.getBool(false):
+        recorded = true
+        break
+      sleep(100)
+    stopProcess(seed, 1500)
+    check("seed a spawn record for the trust gate", recorded)
+
+    let deniedLog = untrusted.root / "var" / "untrusted.log"
+    let denied = startComponent(untrusted.sandboxBin("niffler"), busUrl,
+      root = untrusted.root, extra = [("NIF_TRUST", "never")],
+      logFile = deniedLog)
+    var deniedUp = false
+    for i in 0 ..< 100:
+      let r = call(client, "core", "catalog", %*{"op": "list"}, 3_000)
+      if r{"error"} == nil and r{"tools"} != nil:
+        deniedUp = true
+        break
+      sleep(200)
+    check("an untrusted home still boots and is inspectable", deniedUp)
+    let status = call(client, "core", "status", newJObject(), 10_000)
+    var started: seq[string]
+    if status{"components"} != nil:
+      for c in status{"components"}: started.add(c{"name"}.getStr(""))
+    check("an untrusted home starts the bootstrap set",
+          "store" in started and "bash" in started, $started)
+    check("an untrusted home does not autostart manifest components",
+          "plugins" notin started, $started)
+    check("an untrusted home does not restore spawn records",
+          "plugins" notin started, $started)
+    stopProcess(denied, 2000)
+    let boot = if fileExists(deniedLog): readFile(deniedLog) else: ""
+    check("the boot says which components it skipped and why",
+          boot.contains("UNTRUSTED") and
+          boot.contains("skipping manifest autostart component 'plugins'"),
+          boot[0 ..< min(1200, boot.len)])
+
+    let trustLog = untrusted.root / "var" / "trusted.log"
+    let trusted = startComponent(untrusted.sandboxBin("niffler"), busUrl,
+      root = untrusted.root, extra = [("NIF_TRUST", "always")],
+      logFile = trustLog)
+    defer: stopProcess(trusted, 2000)
+    var trustedUp = false
+    for i in 0 ..< 100:
+      let r = call(client, "core", "catalog", %*{"op": "list"}, 3_000)
+      if r{"error"} == nil and r{"tools"} != nil:
+        trustedUp = true
+        break
+      sleep(200)
+    var trustedStarted: seq[string]
+    let trustedStatus = call(client, "core", "status", newJObject(), 10_000)
+    if trustedStatus{"components"} != nil:
+      for c in trustedStatus{"components"}:
+        trustedStarted.add(c{"name"}.getStr(""))
+    check("NIF_TRUST=always restores exactly today's behaviour",
+          trustedUp and "plugins" in trustedStarted, $trustedStarted)
 
   report("CORE TEST")
 
