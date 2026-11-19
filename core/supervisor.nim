@@ -17,6 +17,19 @@ type
 
 var gGitHash = ""
 
+proc coreLog*(msg: string) =
+  ## Timestamped core/supervisor line on stdout.
+  ##
+  ## Core writes its lifecycle to stdout, which UI autostart redirects to
+  ## var/logs/core.log (scripts/niffler-tui.in, install.sh). Components log
+  ## timestamped JSONL via sdk.log; core's lines had no timestamp at all, so a
+  ## "supervisor: draining 34 children" could not be attributed to a minute —
+  ## which made an operator's own shutdown indistinguishable from a crash or a
+  ## stray kill, and cost a real investigation at 20:15 on 2026-11-10. The
+  ## zero-padded '.fff' keeps ordering obvious and matches the ISO-ish style
+  ## the rest of our tooling emits.
+  echo "[" & now().utc.format("yyyy-MM-dd'T'HH:mm:ss'.'fff'Z'") & "] " & msg
+
 proc harnessGitHash*(root: string): string =
   ## Short commit of the harness checkout, cached. The clone is the home of
   ## an instance — this is the second half of the identity a user sees (with
@@ -45,7 +58,7 @@ proc parsePolicy*(s: string): RestartPolicy =
   of "never": rpNever
   of "on-failure": rpOnFailure
   else:
-    echo "supervisor: unknown restart policy '" & s & "' — using on-failure"
+    coreLog("supervisor: unknown restart policy '" & s & "' — using on-failure")
     rpOnFailure
 
 type
@@ -99,6 +112,53 @@ proc sweepLogs*(sup: Supervisor, maxAgeDays: float, maxTotalMb: float) =
         removeFile(f.path)
       except CatchableError:
         discard
+
+proc rotateFile(path: string, suffix: string, maxBytes: int64) =
+  ## Rotate ONE file in place when it outgrows maxBytes: copy the tail to
+  ## <path><suffix>, then truncate the live file.
+  ##
+  ## COPY-THEN-TRUNCATE, never rename. The harness's own stdout (var/logs/core.log)
+  ## is an inherited fd opened by whichever UI autostarted core — scripts/
+  ## niffler-tui.in and scripts/install.sh both do `>>core.log`, and neither can
+  ## be made to follow a rename. rename(2) would leave core writing to an
+  ## unlinked inode: the log silently vanishes while the disk keeps filling,
+  ## which is worse than no rotation at all. Truncating the SAME inode keeps
+  ## every writer valid. The cost is the retained history: at most one suffix
+  ## file per name, overwritten each time, so `core.log` (live) +
+  ## `core.log.1` (previous) — bounded, no chain to prune.
+  try:
+    if not fileExists(path): return
+    if getFileSize(path) <= maxBytes: return
+    # Copy the whole file, not just the tail: the caller learns the window from
+    # the live file's new size, and a partial tail would make the retained file
+    # claim to start where it does not.
+    copyFile(path, path & suffix)
+    let live = open(path, fmWrite)   # truncates, keeps the inode
+    live.close()
+  except CatchableError:
+    discard
+
+proc rotateLogs*(sup: Supervisor, maxBytes: int64) =
+  ## Size-based rotation for var/logs, run from the hourly sweep and at boot
+  ## (core/niffler.nim). sweepLogs only DELETES whole files, so a long-lived
+  ## harness had exactly one unbounded file: core.log reached 7 712 lines /
+  ## 576 KB across a handful of boots on 2026-11-10, with nothing marking where
+  ## one boot ended — so a shutdown could not be told from a crash even after
+  ## the lines gained timestamps. Rotation keeps one previous generation.
+  ##
+  ## Every log rotates, not just core.log: a component that chatters (a restart
+  ## loop logging its last output, e.g. jev's 343 crash lines) has the same
+  ## problem, and sweepLogs cannot help because it only acts on age and total
+  ## size, never on one file being large.
+  if maxBytes <= 0: return
+  let dir = sup.root / "var" / "logs"
+  if not dirExists(dir): return
+  for kind, path in walkDir(dir):
+    if kind != pcFile: continue
+    # Skip the previous generations: rotating "core.log.1" into "core.log.1.1"
+    # grows a chain and doubles the disk it is meant to bound.
+    if path.endsWith(".1"): continue
+    rotateFile(path, ".1", maxBytes)
 
 proc logTail(path: string, maxLines: int): string =
   ## Last lines of a child's log file, for the death report. Missing or
@@ -169,8 +229,8 @@ proc startChild*(sup: Supervisor, c: Child, args: seq[string] = @[]) =
         cmd.add(quoteShell(sp) & " --pdeathsig TERM ")
       elif not setprivWarned:
         setprivWarned = true
-        echo "supervisor: warn: no setpriv with --pdeathsig (util-linux; Alpine: " &
-          "apk add setpriv) — non-SDK children are not killed if core is SIGKILLed"
+        coreLog("supervisor: warn: no setpriv with --pdeathsig (util-linux; Alpine: " &
+          "apk add setpriv) — non-SDK children are not killed if core is SIGKILLed")
   cmd.add(quoteShell(c.binary))
   let argv = if args.len > 0: args else: c.args
   for a in argv:
@@ -180,7 +240,7 @@ proc startChild*(sup: Supervisor, c: Child, args: seq[string] = @[]) =
   # stdout/stderr pipes carry nothing (redirected at exec) and are never read.
   c.process = startProcess("/bin/sh", workingDir = sup.root, args = ["-c", cmd],
                            options = {poUsePath})
-  echo "supervisor: started " & c.childLabel() & " (" & c.binary & ")"
+  coreLog("supervisor: started " & c.childLabel() & " (" & c.binary & ")")
 
 proc addChild*(sup: Supervisor, name, binary: string,
                policy: RestartPolicy = rpOnFailure,
@@ -226,10 +286,10 @@ proc pump*(sup: Supervisor, cat: Catalog) =
     c.restarts += 1
     let backoff = backoffMs(c.restarts)
     c.nextStart = now + backoff / 1000.0
-    echo "supervisor: " & c.childLabel() & " died (exit " & $code &
-         ", restart #" & $c.restarts & ", backoff " & $backoff.int & "ms)"
+    coreLog("supervisor: " & c.childLabel() & " died (exit " & $code &
+         ", restart #" & $c.restarts & ", backoff " & $backoff.int & "ms)")
     if tail.len > 0:
-      echo "supervisor:   last output: " & tail
+      coreLog("supervisor:   last output: " & tail)
     startChild(sup, c)
   # delete the recorded indices descending so earlier indices stay valid
   for i in countdown(retired.len - 1, 0):
@@ -264,12 +324,12 @@ proc removeChild*(sup: Supervisor, name: string): bool =
       c.process.close()
       c.process = nil
     delete(sup.children, idx)
-  echo "supervisor: removed " & name & " (" & $indices.len & " replica(s))"
+  coreLog("supervisor: removed " & name & " (" & $indices.len & " replica(s))")
   return true
 
 proc drain*(sup: Supervisor) =
   ## Reverse registration order: drain event → grace → SIGTERM → SIGKILL.
-  echo "supervisor: draining " & $sup.children.len & " children"
+  coreLog("supervisor: draining " & $sup.children.len & " children")
   for c in sup.children:
     c.wanted = false
   # One broadcast reaches every process, including every replica.
@@ -288,4 +348,4 @@ proc drain*(sup: Supervisor) =
     if not c.process.running():
       c.process.close()
       c.process = nil
-  echo "supervisor: drained"
+  coreLog("supervisor: drained")

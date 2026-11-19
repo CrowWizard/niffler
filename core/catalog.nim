@@ -61,6 +61,12 @@ type
     ## onChange fires before ev.catalog.updated is published; the system core
     ## uses it to checkpoint the merged slash table into the store.
     onChange*: proc (cat: Catalog)
+    ## ownsRoot answers "does that root belong to this harness?" — the system
+    ## core wires it to its own NIF_ROOT; a session runner leaves it nil (it
+    ## owns no children and must accept the system's snapshot). Nil disables
+    ## the check. See the reg.publish guard for why a registration depends on
+    ## it.
+    ownsRoot*: proc (root: string): bool {.closure.}
     sub*: ptr natsSubscription
 
 proc newCatalog*(nc: NatsConnection): Catalog =
@@ -301,6 +307,18 @@ proc newCatalog*(nc: NatsConnection): Catalog =
       "description": "Ensure a conversation's session runner is alive and return its direct call subject, without running a turn. Used by components that drive subagent sessions mid-turn (core's session tool would forward the call and the busy runner would refuse it).",
       "properties": {"sessionId": {"type": "string"}},
       "required": ["sessionId"],
+      "x-harness": {"hidden": true}
+    }))
+  coreReg.tools.add(ToolReg(name: "sandbox_inherit", component: "core",
+    schema: %*{
+      "type": "object",
+      "description": "Snapshot a parent conversation's sandbox policy into a child at birth. Core owns policy storage and revisioning, so a component asks rather than duplicating the rule. Birth path only; the child's own control path cannot widen what it received.",
+      "properties": {
+        "parent": {"type": "string", "description": "Conversation whose effective policy is copied"},
+        "sessionId": {"type": "string", "description": "The child conversation being created"},
+        "workspace": {"type": "string", "description": "The child's workspace, added as a root so an inherited policy is usable in a different tree"}
+      },
+      "required": ["parent", "sessionId"],
       "x-harness": {"hidden": true}
     }))
   coreReg.tools.add(ToolReg(name: "ui", component: "core",
@@ -833,7 +851,33 @@ proc dropRegistration(cat: Catalog, name, reason: string) =
   echo "catalog: " & name & " " & reason
   cat.announce()
 
-proc handle(cat: Catalog, subject, data: string) =
+var rootWarnings: Table[string, bool]
+
+proc warnMissingRoot(name: string) =
+  ## Say once per component that a registration arrived WITHOUT a root, so an
+  ## unvouchable publisher is visible instead of silently trusted. Not a
+  ## refusal: older SDKs and hand-rolled publishers predate the field, and a
+  ## harness must not break them on upgrade.
+  if rootWarnings.hasKey(name): return
+  rootWarnings[name] = true
+  echo "catalog: " & name & " registered without a root — cannot verify it " &
+       "serves this harness (an older SDK?); a component from ANOTHER root " &
+       "answering this bus's calls looks exactly like this"
+
+proc registrationTrace*(subject: string, node: JsonNode): string =
+  ## Bounded identity evidence, independent of the store and persisted in core.log.
+  ## JSON quoting keeps an announced path/name from forging another log line.
+  let identity = %*{"subject": subject, "name": node{"name"}.getStr("")[0 ..<
+      min(node{"name"}.getStr("").len, 128)],
+    "pid": node{"pid"}.getInt(0), "root": node{"root"}.getStr("")[0 ..<
+      min(node{"root"}.getStr("").len, 4096)],
+    "version": node{"version"}.getStr("")[0 ..<
+      min(node{"version"}.getStr("").len, 128)],
+    "client": node{"client"}.getBool(false)}
+  "[" & now().utc.format("yyyy-MM-dd'T'HH:mm:ss'.'fff'Z'") &
+    "] catalog: registration " & $identity
+
+proc handle(cat: Catalog, subject, data: string, reply = "") =
   var node: JsonNode
   try:
     node = data.parseJson()
@@ -841,6 +885,20 @@ proc handle(cat: Catalog, subject, data: string) =
     return
   let name = node{"name"}.getStr("")
   if name.len == 0: return
+  # Only the system catalog owns admission. Runners seed snapshots and must
+  # not multiply diagnostic traffic. Record BEFORE admission, including refused
+  # and legacy publishers: a later PID count alone cannot identify a stray store.
+  if cat.ownsRoot != nil:
+    echo registrationTrace(subject, node)
+
+  var admissionAnswered = false
+  proc admissionReply(ok: bool) =
+    if reply.len == 0 or cat.ownsRoot == nil or admissionAnswered: return
+    let verdict = %*{"ok": ok, "name": name, "pid": node{"pid"}.getInt(0),
+      "reason": (if ok: "" else: cat.lastRejection(name))}
+    cat.nc.publish(reply, $verdict)
+    admissionAnswered = true
+  defer: admissionReply(false)
 
   # "core" is the control plane itself — its tools are seeded above and
   # must not be spoofable or replaceable by a bus citizen (docs/ARCHITECTURE.md)
@@ -848,7 +906,10 @@ proc handle(cat: Catalog, subject, data: string) =
     cat.noteRejection(name, "reserved component name")
     return
 
-  if subject == "reg.publish":
+  if subject in ["reg.publish", "reg.admit"]:
+    # Admission requests have exactly one authority; runner catalogs follow
+    # the ordinary reg.publish sent once the component is actually serving.
+    if subject == "reg.admit" and cat.ownsRoot == nil: return
     var reg = ComponentReg(name: name,
                            version: node{"version"}.getStr(""),
                            pid: node{"pid"}.getInt(0),
@@ -865,6 +926,47 @@ proc handle(cat: Catalog, subject, data: string) =
       reg.pids.add(reg.pid)
     if reg.pid <= 0 and reg.pids.len > 0:
       reg.pid = reg.pids[0]
+    if name == "store" and reg.pids.len != 1:
+      cat.noteRejection(name, "SINGLE-WRITER VIOLATION: store must announce " &
+        "exactly one positive PID, incoming pids=" & $reg.pids)
+      return
+    # A NON-CLIENT component must serve THIS core's root.
+    #
+    # The catalog trusts whoever publishes reg.publish, which assumed every
+    # publisher on the bus serves this harness. That assumption breaks when a
+    # component of another root — a test root, a second clone, a dev checkout
+    # — lands on the same bus: it subscribes with queue group == component
+    # name, so it joins THIS harness's `store` (or `llm`, `provider`, ...)
+    # queue group and answers a SLICE of the calls from a different, often
+    # empty database. The result is indistinguishable from data loss:
+    # `provider_get` returns a definitive not-found for a nickname that
+    # exists, /fav lists nothing, a session cannot read its own transcript —
+    # intermittently, because the foreign replica takes only some of the
+    # queue. That is the 2026-11-10 21:35/22:36 incidents (the database was
+    # intact throughout; foreign processes were answering).
+    #
+    # Root identity, not pid: a stub llm a test starts from the SAME root is
+    # a legitimate stand-in, while any process from another root is by
+    # definition reading another database. It also needs no supervisor state,
+    # so it works for components core did not spawn.
+    #
+    # Interactive clients are exempt: a UI answers no tool subject, so it
+    # cannot misroute a call, and older clients do not announce a root.
+    if not reg.client and cat.ownsRoot != nil:
+      let announced = (if node{"root"} != nil: node{"root"}.getStr("")
+                       else: "")
+      if announced.len > 0 and not cat.ownsRoot(announced):
+        cat.noteRejection(name, "that process serves root " & announced &
+          ", not this harness — refusing a foreign component that would " &
+          "join the '" & name & "' queue group on this bus and answer " &
+          "this harness's calls from another database (a second root/clone " &
+          "attached to this bus; give that root its own bus)")
+        return
+      # An announcement WITHOUT a root cannot be vouched for. Accept it (older
+      # SDKs and hand-rolled publishers must keep working) but say so once per
+      # name: a silent accept is exactly how the foreign-replica bug hid.
+      if announced.len == 0:
+        warnMissingRoot(name)
     # tool names are unique across the whole catalog (docs/WIRE.md). A clash
     # refuses the ENTIRE registration, before any state changes: a component
     # that joins minus its colliding tool shows up "installed" while silently
@@ -896,6 +998,16 @@ proc handle(cat: Catalog, subject, data: string) =
     # singular while the service has N workers.
     if cat.components.hasKey(name):
       var current = cat.components[name]
+      # The mandatory persistence service is single-writer, never a replica
+      # group. Re-announcing its existing PID after recovery is legitimate.
+      # This is an admission alarm, not NATS subscription fencing: SDKs must
+      # refuse the wrong bus BEFORE they subscribe.
+      if name == "store" and reg.pids != current.pids:
+        cat.noteRejection(name, "SINGLE-WRITER VIOLATION: extra store refused; " &
+          "recorded pids=" & $current.pids & ", incoming pids=" & $reg.pids &
+          ". A foreign subscription may already be answering store calls; " &
+          "inspect the preceding registration identity and NATS connections")
+        return
       var compatible = current.client == reg.client and
                        current.tools.len == reg.tools.len
       if compatible:
@@ -924,6 +1036,7 @@ proc handle(cat: Catalog, subject, data: string) =
       cat.clearRejection(name)
       echo "catalog: " & name & " replica registered (" &
            $current.pids.len & " live)"
+      admissionReply(true)
       cat.announce()
       return
     for t in reg.tools:
@@ -983,17 +1096,25 @@ proc handle(cat: Catalog, subject, data: string) =
     cat.clearRejection(name)
     echo "catalog: " & name & " v" & reg.version & " registered (" &
          $reg.tools.len & " tools, " & $reg.slash.len & " slash commands)"
+    # Reply before checkpointing: the store is not subscribed until admission
+    # succeeds, so a checkpoint request here must not delay its admission.
+    admissionReply(true)
     cat.announce()
 
   elif subject == "reg.depart":
     if cat.components.hasKey(name):
       let pid = node{"pid"}.getInt(0)
+      # A foreign process may not retire OUR registration: a depart is only
+      # honoured for a pid this registry actually holds (an unowned pid was
+      # refused at publish time, and guessing here would let any bus citizen
+      # erase a component).
       var reg = cat.components[name]
       if pid > 0 and reg.pids.len > 0:
         var remaining: seq[int]
         for livePid in reg.pids:
           if livePid != pid: remaining.add(livePid)
-        # Ignore a stale/duplicate departure rather than dropping peers.
+        # Ignore a stale/duplicate/foreign departure rather than dropping
+        # peers.
         if remaining.len == reg.pids.len: return
         if remaining.len > 0:
           reg.pids = remaining
@@ -1011,15 +1132,36 @@ proc applyReg*(cat: Catalog, node: JsonNode) =
   ## catalog from the system's snapshot taken at startup.
   handle(cat, "reg.publish", $node)
 
+proc arriveForTest*(cat: Catalog, subject, data: string) =
+  ## Feed one raw registration message through the same admission path as the
+  ## bus subscription (tests pin refusals that `applyReg` cannot express, e.g.
+  ## a foreign `reg.depart`). Not used by core.
+  handle(cat, subject, data)
+
 proc clientCount*(cat: Catalog): int =
   ## Registered interactive frontends (reg.publish with "client": true).
   ## An autostarted core exits when this returns to zero.
   for comp in cat.components.values:
     if comp.client: inc result
 
+proc announceDeparture*(cat: Catalog, name: string, pid: int) =
+  ## Tell the bus that one registered pid is gone. A component normally
+  ## publishes its own reg.depart; when the SUPERVISOR observes the death
+  ## instead, this core is the supervisor of record for that pid and peers
+  ## depend on hearing it — a catalog that keeps a dead pid keeps advertising
+  ## a service nothing can reach (for a session runner that is fatal:
+  ## ensureRunner's presence test skips the replacement and every turn is
+  ## published into the void — the stuck conversation conv-86b2545d9f27,
+  ## 2026-10-14). reg.publish/reg.depart are bare JSON, not envelopes. The
+  ## reg.depart handler ignores a pid it does not hold (stale duplicate), so
+  ## the announcement converges in one pass and never loops.
+  cat.nc.publish("reg.depart", $ %*{"name": name, "pid": pid})
+
 proc dropReplica*(cat: Catalog, name: string, pid: int) =
   ## Called by the supervisor when one process dies without reg.depart. Keep
-  ## the logical component registered while another queue-group replica lives.
+  ## the logical component registered while another queue-group replica lives,
+  ## and announce the death so other catalogs on the bus drop the same pid
+  ## (announceDeparture).
   if not cat.components.hasKey(name): return
   var reg = cat.components[name]
   if pid > 0 and reg.pids.len > 0:
@@ -1027,6 +1169,7 @@ proc dropReplica*(cat: Catalog, name: string, pid: int) =
     for livePid in reg.pids:
       if livePid != pid: remaining.add(livePid)
     if remaining.len == reg.pids.len: return
+    cat.announceDeparture(name, pid)
     if remaining.len > 0:
       reg.pids = remaining
       reg.pid = remaining[0]
@@ -1040,6 +1183,44 @@ proc dropComponent*(cat: Catalog, name: string) =
   ## Remove an entire logical component (all replicas), used by explicit
   ## core.kill/core.remove. Crashes use dropReplica instead.
   cat.dropRegistration(name, "removed")
+
+proc pidAlive*(pid: int): bool =
+  ## Liveness probe for a registered pid: signal 0 asks the kernel whether the
+  ## process exists without delivering anything. Platforms without a cheap
+  ## equivalent (and any pid <= 0) assume presence, never death.
+  when defined(posix):
+    if pid <= 0: return false
+    result = kill(Pid(pid), 0) == 0
+  else:
+    result = pid > 0
+
+proc registrationAlive*(reg: ComponentReg): bool =
+  ## Does this registration still describe a running process? Presence in the
+  ## catalog is no proof of life: a component that dies without a reg.depart
+  ## (SIGKILL, a drain timeout, a death its own core never announced) leaves
+  ## its registration behind, and so does a replica mirrored from another
+  ## harness on the bus whose process is long gone. Callers that must not act
+  ## on a corpse ask here instead of testing "hasKey" — see
+  ## ensureRunner/dropPhantom. A registration naming no pid at all counts as
+  ## alive: spawning on missing information is the worse error. pid reuse can
+  ## keep a dead entry looking alive for a while — the same trade-off
+  ## reapDeadClients accepts for the cheap probe.
+  if reg.pids.len > 0:
+    for pid in reg.pids:
+      if pidAlive(pid): return true
+    return false
+  if reg.pid > 0: return pidAlive(reg.pid)
+  return true
+
+proc dropPhantom*(cat: Catalog, name: string): bool =
+  ## Drop a registration whose every pid is gone (registrationAlive) so a
+  ## liveness-testing caller can proceed; returns true when one was dropped.
+  ## Distinct from dropComponent: nothing is running here to stop, and the
+  ## entry is removed because it is a lie, not because a human asked.
+  if not cat.components.hasKey(name): return false
+  if registrationAlive(cat.components[name]): return false
+  cat.dropRegistration(name, "lost (phantom: no live pid)")
+  return true
 
 var lastClientSweep = 0.0
 
@@ -1064,7 +1245,7 @@ proc reapDeadClients*(cat: Catalog) =
     if not reg.client: continue
     var alive = false
     for pid in reg.pids:
-      if pid > 0 and kill(Pid(pid), 0) == 0: alive = true
+      if pidAlive(pid): alive = true
     if not alive and reg.pids.len > 0:
       dead.add(name)
   for name in dead:
@@ -1082,5 +1263,7 @@ proc pump*(cat: Catalog) =
     if not checkStatus(st): break
     let subject = $natsMsg_GetSubject(msg)
     let data = $natsMsg_GetData(msg)
+    let replyPtr = natsMsg_GetReply(msg)
+    let reply = if replyPtr == nil: "" else: $replyPtr
     natsMsg_Destroy(msg)
-    cat.handle(subject, data)
+    cat.handle(subject, data, reply)

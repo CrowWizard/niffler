@@ -51,6 +51,7 @@ proc main() =
                      adviseStream: new(AdviseStream),
                      mapStream: new(MapStream),
                      diagStream: new(DiagStream),
+                     memoryStream: new(MemoryStream),
                      activeTurn: new(ActiveTurn),
                      lockState: new(LockState),
                      sessionAllowlist: new(seq[string]))
@@ -68,7 +69,17 @@ proc main() =
   try:
     let snap = dispatchToolCall(ct, "catalog", %*{"op": "snapshot"}, 15_000)
     for comp in snap{"components"}:
-      cat.applyReg(comp)
+      # Name the component in any failure. A seed that dies on one malformed
+      # registration used to abort with a bare message, leaving the runner
+      # tool-blind with nothing saying WHICH component did it — and a runner
+      # that cannot see the catalog answers every invoke with "not available",
+      # which reads like a missing tool rather than a broken registration.
+      let label = comp{"name"}.getStr("?")
+      try:
+        cat.applyReg(comp)
+      except CatchableError as e:
+        echo "session: WARNING cannot seed " & label & ": " & e.msg &
+             " — continuing; other components still register"
   except CatchableError as e:
     echo "session: WARNING cannot seed catalog: " & e.msg
 
@@ -118,6 +129,21 @@ proc main() =
                      getErrorString(dst))
     quit(1)
   ct.diagStream.sub = diagSub
+  # Durable-memory recall channel: the memory component publishes the rendered
+  # block of facts this conversation should see unasked, once at the first turn
+  # and again after a compaction. pumpMemory drains it and drainMemory appends
+  # it as append-only history — never the frozen prefix (docs/research/MEMORY.md
+  # §4). Its own lane, because the repo-map lane keeps only one message per
+  # conversation and would starve this one.
+  let memorySubjectStr = memorySubject(sessionId)
+  var memorySub: ptr natsSubscription
+  let mstMem = natsConnection_SubscribeSync(addr memorySub, nc.conn,
+                                            memorySubjectStr.cstring)
+  if not checkStatus(mstMem):
+    stderr.writeLine("session: subscribe " & memorySubjectStr & ": " &
+                     getErrorString(mstMem))
+    quit(1)
+  ct.memoryStream.sub = memorySub
   # Advisory channel: sync subscribe to svc.session.<id>.advise (docs/research/EXPERT.md).
   # pumpAdvise answers each turn-bound advisory request — accepted only while
   # that turn is live — from dispatch's idle slot during a turn and from the
@@ -165,10 +191,13 @@ proc main() =
     pumpBusyCall(ct)
     pumpMap(ct)
     pumpDiag(ct)
+    pumpMemory(ct)
     pumpAdvise(ct)
     pumpNested(ct)
   approval.cancelled = proc(): bool =
-    ct.steerStream != nil and ct.steerStream.cancelRequested
+    # Stop controls belong to a live turn, not a later client tool control.
+    ct.activeTurn != nil and ct.activeTurn.session.len > 0 and
+      ct.steerStream != nil and ct.steerStream.cancelRequested
   # Readiness signal for the system's ensureRunner: presence in the catalog.
   let reg = %*{"name": name, "version": "0.1.0", "pid": getCurrentProcessId(),
                "tools": newJArray()}
@@ -202,6 +231,7 @@ proc main() =
       pumpAdvise(ct)
       pumpMap(ct)
       pumpDiag(ct)
+      pumpMemory(ct)
       drainIdleCleanDiagnostics(ct, sessionId)
       if epochTime() - lastActivity > idleLimitSecs:
         echo "session: retiring after " & $idleLimitSecs.int & "s idle"

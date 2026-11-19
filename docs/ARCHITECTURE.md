@@ -64,12 +64,15 @@ internal children (restart policy `never`), not agent capabilities.
 
 ### 4. Catalog authority — `core/catalog.nim`
 
-The live registry: `reg.publish`/`reg.depart` handling, global tool-name
-uniqueness enforcement, exposure projection (`x-harness.hidden` removes a
-tool from every LLM view; `x-harness.onDemand` keeps it out of the per-
-conversation direct set but discoverable via `discover`), schema
-normalization, `ev.catalog.updated` announcements. Routing always uses the
-full catalog — exposure shapes prompts, not dispatch rights.
+The live registry: `reg.publish`/`reg.admit`/`reg.depart` handling, global
+tool-name uniqueness enforcement, exposure projection (`x-harness.hidden`
+removes a tool from every LLM view; `x-harness.onDemand` keeps it out of the
+per-conversation direct set but discoverable via `discover`), schema
+normalization, `ev.catalog.updated` announcements. It also answers
+`reg.admit`, refusing a second `store` PID before that store subscribes, and
+records bounded timestamp/PID/root identity lines for arrivals, refusals and
+departures in the rotating core log without consulting the store. Routing
+always uses the full catalog — exposure shapes prompts, not dispatch rights.
 
 The borderline case — it is almost a component (a `reg.>` subscriber). It stays
 in core because it must (a) exist before any component registers — boot order —
@@ -118,7 +121,7 @@ The mechanisms that *are* components, and the capability they carry:
 | `bash` | execution | general-purpose machine access |
 | `plugins` | ecosystem | discovery + install of third-party component packages (topic search, `niffler.json` manifest, source builds) |
 | `edit` | file tools | `read` (one `path` or a batched `reads` array — up to 12 files/ranges, pageable; select items locate-then-fetch with grep semantics) / `edit` (exact old_string/new_string, uniqueness enforced, guarded fallback cascade, `replace_all`) / `replace_across` (sed-style literal s///g across a file set in one call, per-file counts and per-file undo) / `write` (atomic whole-file) / `undo_last_edit`; `read`/`edit`/`replace_across`/`write` carry session-variable pipeline controls; anchored block moves live in the niffler-hashline plugin |
-| `git` | repo inspection | read-only `git_status`/`git_diff`/`git_log`/`git_show`/`git_blame` over fixed argv, plus the local `review_receipt` diff-fingerprint write/check pair; mutations stay in bash |
+| `git` | repo inspection and worktree flow | `git_status`/`git_diff`/`git_log`/`git_show`/`git_blame` over fixed argv, plus the local `review_receipt` diff-fingerprint write/check pair; with the `git.mutations` setting on (the default) it also registers the approval-gated worktree/merge/commit verbs |
 | `lsp` | language-server seam | one `lsp` tool (`diagnostics`, `documentSymbol`, `workspaceSymbol`, `goToDefinition`, `findReferences`, `goToImplementation`, `hover`, `warmup`) plus `lsp_servers`/`lsp_registry` over any configured stdio language server; the registry is data (`$XDG_CONFIG_HOME/niffler-lsp/servers.json`), so adding a language is a config entry or an approval-gated `lsp_registry add` — never code |
 | `observe` | live introspection | bounded raw-bus ring, targeted probes/traces, and server monitoring |
 | `logfile` | diagnostic persistence | rotating best-effort JSONL sink; no JetStream/audit guarantee |

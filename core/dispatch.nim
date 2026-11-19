@@ -5,17 +5,19 @@
 ## The approval interceptor (x-harness.approval, see approval.nim) gates
 ## both paths: core tools here, component tools below.
 
-import std/[algorithm, json, monotimes, os, osproc, sets, strutils,
-            tables, times]
+import std/[algorithm, json, monotimes, os, osproc, sets, strutils, times,
+            tables]
 import yaml/tojson
 import natsnim
 import ../sdk/envelope
 import ../sdk/subjects
 import ../sdk/checkout
 import ../sdk/niffler/sandboxpolicy
+import ../sdk/niffler/procutil
 import approval
 import catalog
 import compaction
+import notices
 import schema_validation
 import admission
 import taskpolicy
@@ -54,6 +56,10 @@ type
                                        ## the lsp component publishes on
                                        ## svc.session.<id>.diag, pumpDiag drains,
                                        ## runTurn appends — see DiagStream)
+    memoryStream*: MemoryStream        ## durable-memory recall channel (runners only;
+                                       ## components/memory publishes on
+                                       ## svc.session.<id>.memory, pumpMemory
+                                       ## drains, runTurn appends — docs/research/MEMORY.md)
     adviseStream*: AdviseStream        ## turn-bound advisory queue (runners only)
     activeTurn*: ActiveTurn            ## live turn identity (set by runTurn)
     sessionAllowlist*: ref seq[string] ## frozen per-session tool allowlist
@@ -105,7 +111,14 @@ type
   MapStream* = ref object
     sub*: ptr natsSubscription
     queue*: seq[tuple[workspace, map: string]]
-    appended*: bool          # one map per conversation
+    appended*: HashSet[string]
+      ## One map per WORKSPACE, not per conversation: a conversation that
+      ## changes workspace (`/worktree add`, `/worktree close`, an explicit
+      ## `session {cwd}`) must get the map of the tree it is now in. Keyed on
+      ## a bare bool, the first map was appended for the conversation's
+      ## lifetime and a moved conversation kept describing the tree it had
+      ## left — a model reading a stale map is worse off than one with none,
+      ## because it reasons confidently about the wrong files.
   # Asynchronous LSP-diagnostics channel (svc.session.<id>.diag): the edit
   # tool asks the lsp component for diagnostics WITHOUT waiting (a cold
   # rust-analyzer/jdtls needs minutes, and every edit used to pay a 25s
@@ -117,6 +130,18 @@ type
   DiagStream* = ref object
     sub*: ptr natsSubscription
     queue*: seq[tuple[path, text: string, clean: bool]]
+  # Durable-memory recall channel (svc.session.<id>.memory): the memory
+  # component decides ONCE per conversation (at its first turn, and again after
+  # a compaction) which of its facts the model should see unasked, and
+  # publishes the rendered block here. The runner drains it and appends it as
+  # history — append-only, so the frozen prefix is never touched
+  # (docs/research/MEMORY.md §4). A lane of its own, not the repo-map one:
+  # drainMapQueue keeps at most ONE map per conversation, so sharing would let
+  # a map starve the recall block (or the reverse).
+  MemoryStream* = ref object
+    sub*: ptr natsSubscription
+    queue*: seq[string]        # rendered recall blocks, oldest first
+    appended*: bool            # at most one block per conversation lifetime
   # Raised from a dispatch's idle slot when a turn cancellation arrives
   # while that dispatch is in flight: the caller stops waiting for the
   # reply immediately. The callee keeps running (NATS request/reply has no
@@ -174,6 +199,19 @@ type
       ## Kept separate from rootsKey because the two answer different
       ## questions: a grant must still rebuild when the graph is unchanged,
       ## and a new tree must rebuild when nothing was granted.
+    sandboxCached*: JsonNode
+      ## The encoded policy last handed to components, with the monotonic stamp
+      ## it was read at. A cross-process decision (another client can call
+      ## `session {sandbox}` at any moment) cannot be cached forever, so this
+      ## expires — see sandboxPolicyFor.
+    sandboxAt*: int64
+      ## getMonoTime().ticks when sandboxCached was read (0 = never).
+    sandboxKey*: string
+      ## Invalidation stamp for the conversation's effective sandbox policy
+      ## (core/dispatch.nim loadSandboxPolicy). Empty forces a reload on the
+      ## next dispatch; set to the policy revision once loaded, so a human
+      ## update between calls is picked up without a runner restart and a
+      ## steady-state dispatch does no store read.
     isolation*: string
       ## Per-conversation write scope (WORKTREES.md §4.5): "shared" (default)
       ## or "worktree". Human-only — never in the `session` tool schema, next
@@ -510,6 +548,87 @@ proc claimRootsFor*(primary, isolation: string,
   for r in kept:
     if r != own: ordered.add r
   ordered
+
+# --- conversation sandbox policy (stage A: persist, don't enforce) ----------
+#
+# The effective policy is a SECURITY decision, so it lives in its own store
+# document with a revision and compare-and-set writes, not in the conversation
+# header's best-effort merge helper. Two reasons, both about failure modes a
+# header write has and this one must not:
+#
+# - a swallowed write failure would leave the live policy and the reloaded one
+#   different, and the reloaded one is what the next turn actually gets;
+# - a header merge is last-writer-wins, so two concurrent human edits could
+#   silently drop one — here a stale revision is an explicit refusal.
+#
+# `enabled` is NOT enforcement. Nothing reads it to confine anything yet: it
+# records what the human asked for, and every readback says `enforced: false`
+# until a stage that actually confines something lands. See
+# docs/research/SANDBOX-NEXT-SLICE.md.
+const SandboxPolicyKind = "sandboxpolicy"
+
+proc sandboxPolicyId(session: string): string = session & ":policy"
+
+proc loadSandboxPolicy*(ct: CoreTools, session, workspace: string):
+    tuple[policy: SandboxPolicy, rev: int, persisted: bool] =
+  ## Only an absent record means the initially-off default. Store failures and
+  ## malformed records must propagate: treating either as off disables a
+  ## previously enabled policy exactly when its authority is unavailable.
+  if session.len == 0 or workspace.len == 0:
+    raise newException(ValueError, "sandbox policy needs a session and workspace")
+  result.policy = initialSandboxPolicy(workspace)
+  let item = ct.storeGetItem(SandboxPolicyKind, sandboxPolicyId(session))
+  if item.value == nil: return
+  result.policy = decodeSandboxPolicy(item.value)
+  result.rev = item.rev
+  result.persisted = true
+
+proc saveSandboxPolicy*(ct: CoreTools, session: string, policy: SandboxPolicy,
+                        expectRev: int): tuple[ok: bool, rev: int, error: string] =
+  ## Persist an edited policy. Positive revisions are compare-and-set; -1 is
+  ## create-only, and 0 is an unconditional upsert per the store contract.
+  if session.len == 0:
+    return (false, 0, "a conversation id is required")
+  try:
+    let rev = ct.storePutRev(SandboxPolicyKind, sandboxPolicyId(session),
+                             encodeSandboxPolicy(policy), expectRev = expectRev)
+    return (true, rev, "")
+  except StoreRevisionConflictError:
+    return (false, 0, "the policy changed since you looked at it (revision conflict) — reload and re-apply")
+  except CatchableError as e:
+    return (false, 0, "could not persist the policy: " & e.msg)
+
+proc inheritSandboxPolicyFor*(ct: CoreTools, parentSession, childSession,
+                              childWorkspace: string) =
+  ## Snapshot the parent's policy into a child at birth. An unreadable parent
+  ## or failed child write raises: defaulting to off would widen authority.
+  ## Existing-child revocation remains a separate lifecycle decision.
+  if parentSession.len == 0 or childSession.len == 0:
+    raise newException(ValueError, "sandbox inheritance needs parent and child")
+  let parent = ct.loadSandboxPolicy(parentSession, childWorkspace).policy
+  var inherited = inheritSandboxPolicy(parent)
+  if inherited.enabled:
+    # A child-supplied cwd is not an authority grant. Resolve aliases before
+    # checking containment; siblings must be explicitly approved by the human.
+    # realPathOf, not expandFilename: a child workspace whose directory does not
+    # exist yet makes expandFilename RAISE, surfacing as an obscure OS error
+    # instead of a policy refusal. realPathOf resolves through the deepest
+    # existing ancestor, so an unchosen directory is simply compared.
+    let workspace = realPathOf(childWorkspace)
+    var allowed = false
+    for root in inherited.writeRoots:
+      let resolved = realPathOf(root)
+      if workspace == resolved or workspace.startsWith(resolved & DirSep):
+        allowed = true
+    if not allowed:
+      raise newException(ValueError, "child workspace is outside sandbox write roots")
+  elif childWorkspace.len > 0:
+    inherited.ensureWorkspace(childWorkspace)
+  let saved = ct.saveSandboxPolicy(childSession, inherited, expectRev = -1)
+  if not saved.ok:
+    raise newException(IOError, "sandbox inheritance failed: " & saved.error)
+
+
 
 proc handleCoreTool*(ct: CoreTools, tool: string, args: JsonNode): JsonNode =
   # the self-extension / destructive tools change the harness — human gate first
@@ -856,6 +975,20 @@ proc handleCoreTool*(ct: CoreTools, tool: string, args: JsonNode): JsonNode =
     if ct.prepareSession == nil:
       return %*{"error": "session_prepare is not available in this context"}
     return ct.prepareSession(args{"sessionId"}.getStr(""))
+  of "sandbox_inherit":
+    ## Snapshot a parent's sandbox policy into a child at birth. Core owns this
+    ## because it owns policy storage and revisioning; the agent component asks
+    ## rather than growing a second copy of the rule. Only the BIRTH path may
+    ## call it, and the child's own human control path cannot widen what it
+    ## received (a session with a parent is refused sandbox changes).
+    let parent = args{"parent"}.getStr("")
+    let child = args{"sessionId"}.getStr("")
+    if parent.len == 0 or child.len == 0 or parent == child:
+      return %*{"error": "sandbox_inherit needs distinct parent and sessionId"}
+    ct.inheritSandboxPolicyFor(parent, child, args{"workspace"}.getStr(""))
+    let inherited = ct.loadSandboxPolicy(child, args{"workspace"}.getStr(""))
+    return %*{"ok": true, "enabled": inherited.policy.enabled,
+              "rev": inherited.rev}
   of "catalog":
     # A late-joining client seeds from this snapshot. Drain registrations that
     # arrived before its request so the snapshot cannot lag the live bus.
@@ -867,6 +1000,12 @@ proc handleCoreTool*(ct: CoreTools, tool: string, args: JsonNode): JsonNode =
       ## adopted, and users can see which clone they are talking to.
       return %*{"tools": ct.cat.promptTools(), "root": ct.root,
                 "gitHash": harnessGitHash(ct.root),
+                # The wake budget as an instance fact. A TUI reads THIS shape
+                # (catalog {op: list}) at bootstrap, so the readout must be here
+                # and not only on the component view: it decides whether a
+                # background completion will bring an idle conversation back.
+                # 0 = wakes disabled. Single-sourced from notices.wakeBudget.
+                "maxWakes": wakeBudget(),
                 "instanceId": ct.instanceId, "name": ct.instanceName}
     if args{"op"}.getStr("") == "components":
       ## component→tools view for bus clients that missed the registrations
@@ -892,6 +1031,13 @@ proc handleCoreTool*(ct: CoreTools, tool: string, args: JsonNode): JsonNode =
                 "admissionPolicyVersion": admissionPolicyVersion,
                 "taskPolicyVersion": taskPolicyVersion,
                 "delegationPolicyVersion": delegationPolicyVersion,
+                # Whether a background settlement can start a turn of its own
+                # (0 = wakes disabled). Published because it is the answer to a
+                # question only the CLIENT can put to a human: "if this job
+                # finishes while I am idle, will the conversation come back to
+                # me?". The rule itself stays single-sourced in notices.nim;
+                # this is a readout, not a second policy.
+                "maxWakes": wakeBudget(),
                 "instanceId": ct.instanceId, "name": ct.instanceName}
     if args{"op"}.getStr("") == "schemas":
       return ct.cat.selectedSchemas(args{"tools"})
@@ -952,6 +1098,7 @@ proc handleCoreTool*(ct: CoreTools, tool: string, args: JsonNode): JsonNode =
                 "admissionPolicyVersion": admissionPolicyVersion,
                 "taskPolicyVersion": taskPolicyVersion,
                 "delegationPolicyVersion": delegationPolicyVersion,
+                "maxWakes": wakeBudget(),
                 "instanceId": ct.instanceId, "name": ct.instanceName}
     return %*{"error":
       "catalog op must be 'list', 'components', 'snapshot' or 'schemas'"}
@@ -1662,6 +1809,26 @@ proc pumpDiag*(ct: CoreTools) =
     if path.len == 0 or text.len == 0: continue
     ct.diagStream.queue.add((path, text, env.payload{"clean"}.getBool(false)))
 
+proc pumpMemory*(ct: CoreTools) =
+  ## Drain svc.session.<id>.memory — the memory component's recall block for
+  ## this conversation. Queue for drainMemory, which runTurn appends as
+  ## append-only history; the frozen prefix is untouched (docs/research/MEMORY.md
+  ## §4). Never blocks: the component decides what is worth sending, so the
+  ## runner carries only the rendered text.
+  if ct.memoryStream == nil or ct.memoryStream.sub == nil: return
+  while true:
+    var msg: ptr natsMsg
+    let st = natsSubscription_NextMsg(addr msg, ct.memoryStream.sub, 1)
+    if st == NATS_TIMEOUT: break
+    if not checkStatus(st): break
+    let data = $natsMsg_GetData(msg)
+    natsMsg_Destroy(msg)
+    let env = decode(data)
+    if env.kind != ekEvent or env.payload == nil: continue
+    let text = env.payload{"block"}.getStr("")
+    if text.len > 0:
+      ct.memoryStream.queue.add text
+
 proc pumpAdvise*(ct: CoreTools) =
   ## Drain svc.session.<id>.advise — turn-bound advisory requests from the
   ## expert peer. Each request is answered immediately: accepted only while
@@ -1916,6 +2083,7 @@ proc dispatchSubjectCall*(ct: CoreTools, subject: string, tool: string,
     pumpBusyCall(ct)
     pumpMap(ct)
     pumpDiag(ct)
+    pumpMemory(ct)
     # Turn cancellation while THIS dispatch is in flight: stop waiting for
     # the reply (TurnCancelled). Only during a live turn, and only for a
     # fresh cancel — non-turn dispatches (model selection, session_prepare)
@@ -1978,8 +2146,7 @@ proc saveGrantedRoots*(ct: CoreTools, session, workspace: string,
   if session.len == 0 or workspace.len == 0: return false
   var policy = initialSandboxPolicy(workspace)
   for r in roots:
-    if r notin policy.writeRoots: policy.writeRoots.add r
-    if r notin policy.readRoots: policy.readRoots.add r
+    policy.addGrant(r)
   try:
     discard ct.storePutRev("grantedroot", session & ":roots",
                            encodeSandboxPolicy(policy))
@@ -2058,6 +2225,83 @@ proc workspaceRootsFor*(ct: CoreTools): seq[string] =
     # Same rule as session_info's readback (claimRootsFor).
     return claimRootsFor(primary, ct.nested.isolation, granted)
   ct.nested.workspaceRoots
+
+const SandboxCacheTtlMs = 2000'i64
+  ## How long a dispatch may reuse a policy snapshot. The value is a HUMAN
+  ## decision that another process can change at any moment, so it must not be
+  ## cached for a runner's lifetime; it also must not cost a store round trip on
+  ## every tool call. Two seconds bounds both, and an update inside the window
+  ## is late rather than lost.
+
+proc sandboxPolicyFor*(ct: CoreTools): JsonNode =
+  ## The conversation's effective sandbox policy, as handed to components.
+  ##
+  ## This is the ONE place the decision is read for dispatch, so every path
+  ## (serial, parallel, invoke, nested) sees the same snapshot for the same
+  ## conversation — a policy that one path honored and another ignored would be
+  ## the whole failure mode this stage exists to rule out. Cached briefly, and
+  ## only for a live session: a direct bus call has no conversation, so it has
+  ## no policy and gets none (a caller cannot borrow another's reach).
+  if ct.nested == nil or ct.nested.session.len == 0: return nil
+  if ct.nested.sandboxCached != nil and ct.nested.sandboxKey == ct.nested.session and
+      ct.nested.sandboxAt > 0 and
+      getMonoTime().ticks - ct.nested.sandboxAt < SandboxCacheTtlMs:
+    return ct.nested.sandboxCached
+  let session = ct.nested.session
+  var doc: JsonNode = nil
+  try:
+    # loaded with the CURRENT workspace so an unpersisted conversation still
+    # reports the default it is running under rather than nothing.
+    let loaded = ct.loadSandboxPolicy(session, ct.nested.workspace)
+    doc = encodeSandboxPolicy(loaded.policy)
+    doc["rev"] = %loaded.rev
+    doc["persisted"] = %loaded.persisted
+    # Stamped HERE, not left for a consumer to infer. A component that had to
+    # guess whether the document it received was enforced would eventually guess
+    # optimistically, and "configured" would silently become "sandboxed" in some
+    # component's own wording. False until a stage that confines something.
+    doc["enforced"] = %false
+  except CatchableError:
+    # Unreadable policy must not read as "no policy": a component that sees nil
+    # would take its unrestricted path. An explicit unreadable marker lets an
+    # enforcing component fail closed once any of them enforce.
+    doc = %*{"version": SandboxPolicyVersion, "enabled": false,
+             "unreadable": true, "enforced": false}
+  doc["session"] = %session
+  ct.nested.sandboxCached = doc
+  ct.nested.sandboxAt = getMonoTime().ticks
+  ct.nested.sandboxKey = session
+  doc
+
+proc injectSandboxContext*(ct: CoreTools, schema, callArgs: JsonNode) =
+  ## Private per-dispatch sandbox policy for tools that declare they want it
+  ## (`x-harness.sandbox` in their schema — data, not a component-name list in
+  ## core, so a new component opts in without touching this file).
+  ##
+  ## Two rules make this trustworthy rather than decorative:
+  ##
+  ## - any caller-supplied `__sandbox` is DELETED first. Tool arguments come
+  ##   from the model; a policy a caller can write is not a policy. This is the
+  ##   same reason `__session` is overwritten rather than trusted.
+  ## - a tool that does not declare it does not receive it, and does not keep a
+  ##   smuggled copy on its way through.
+  ##
+  ## Injected after the model's message exists and never into a schema or the
+  ## frozen prompt, so the request prefix is untouched (prompt-cache discipline,
+  ## same as __workspace).
+  if callArgs == nil or callArgs.kind != JObject: return
+  # Nim's json.delete RAISES KeyError ("key not in object") on an absent key —
+  # unlike the JS/Go map APIs a reader may assume. This runs on EVERY dispatch
+  # (including core's own catalog seeding, where nothing declares the field), so
+  # the unconditional form aborted the runner's catalog seed and left it
+  # tool-blind: every invoke then answered "not available through invoke",
+  # which reads like a missing tool rather than a one-line bug here.
+  if callArgs.hasKey("__sandbox"): callArgs.delete("__sandbox")
+  if schema == nil: return
+  if schema{"x-harness"}{"sandbox"} == nil: return
+  let policy = ct.sandboxPolicyFor()
+  if policy == nil: return
+  callArgs["__sandbox"] = policy
 
 proc injectWorkspaceContext*(ct: CoreTools, schema, callArgs: JsonNode) =
   ## Private per-call context for tools that declare the workspace policy
@@ -2581,7 +2825,7 @@ proc dispatchToolCall*(ct: CoreTools, tool: string, args: JsonNode,
   # they are forwarded over the bus (svc.core.call) — one implementation.
   if tool in ["spawn", "catalog", "kill", "remove", "status", "discover",
               "session_info", "activity_list", "prompt_preview", "context_status",
-              "doctor", "ui", "admission_get",
+              "doctor", "ui", "admission_get", "sandbox_inherit",
               "conversation_delete", "toolset", "profile"] and
       not ct.runner:
     let r = ct.handleCoreTool(tool, args)
@@ -2697,6 +2941,9 @@ proc dispatchToolCall*(ct: CoreTools, tool: string, args: JsonNode,
   # message exists — it never enters the request prefix, so worktree awareness
   # costs no cache miss (core/workspace.nim).
   injectWorkspaceContext(ct, schema, callArgs)
+  # The sandbox policy takes the SAME path (stage B): one decision, injected
+  # here and on the parallel wave path below, never readable from arguments.
+  injectSandboxContext(ct, schema, callArgs)
 
   # Session-context tools (fabric, agent): inject the calling session plus a
   # lease for the nested-call proxy. Leases are KEYED (P2.5 B): each dispatch
@@ -2847,6 +3094,7 @@ proc dispatchToolCalls*(ct: CoreTools,
       callArgs{"__session"} = %*{"session":
         (if ct.nested != nil: ct.nested.session else: "")}
     injectWorkspaceContext(ct, schema, callArgs)
+    injectSandboxContext(ct, schema, callArgs)
     let env = callEnvelope(call.tool, callArgs)
     let data = env.encode()
     let inbox = "_INBOX." & newId()
@@ -2924,6 +3172,7 @@ proc dispatchToolCalls*(ct: CoreTools,
     pumpBusyCall(ct)
     pumpMap(ct)
     pumpDiag(ct)
+    pumpMemory(ct)
     pumpAdvise(ct)
     pumpNested(ct)
     # Turn cancellation while this WAVE is in flight, same contract as the

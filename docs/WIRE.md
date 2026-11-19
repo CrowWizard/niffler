@@ -527,11 +527,33 @@ Rules:
 
 ## Subjects
 
+Both shipped store engines request `reg.admit` before subscribing to
+`svc.store.call`, on initial connection and full re-attachment. Core atomically
+reserves the registration before replying; a second store PID is refused even
+with an identical contract/root. Re-announcing the existing PID is allowed.
+A rejected store closes its connection without taking any store calls. A bare
+standalone test bus with no registration subscribers returns NATS no-responders
+and is allowed; timeout, malformed replies, and older cores that subscribe to
+`reg.>` but cannot acknowledge admission fail closed. Upgrade core and store
+together. Legacy binaries that do not request admission cannot be fenced by
+catalog rejection alone; do not leave old components running after upgrading.
+This is cooperative admission, not authentication or a NATS permission boundary.
+
+System core records each registration/admission/departure's timestamp, PID,
+announced root (empty for legacy peers), version and name in `var/logs/core.log`,
+including refused arrivals. These bounded identity lines require no store access
+and use existing core-log rotation. They are evidence of announced identity,
+not proof of process liveness or database integrity, and are not an audit log.
+No frozen prompt prefix or conversation history changes.
+
 ```
+reg.admit              # optional pre-subscription admission request (raw registration
+                       #   JSON); system core replies {ok, name, pid, reason}
 reg.publish            # component process announces itself on connect
                        #   {name, version, pid, tools: [ {name, schema} ], client?,
                        #    slash?: [SlashCommand]}; repeated logical name +
-                       #    identical contract joins its replica group
+                       #    identical contract joins its replica group, except
+                       #    `store` (one PID; see the admission note above)
 reg.depart             # {name, pid, ...}, graceful process departure; the logical
                        #   component remains while another replica PID is live
 svc.<component>.call   # queue-grouped request/reply (one replica handles each call)
@@ -539,7 +561,7 @@ svc.session.<id>.call  # session runner for conversation <id> (queue "session"):
                        #   tool "session" {sessionId, content?, provider?, model?,
                        #   thinking?, title?, cwd?, profile?, discovery?, tools?,
                        #   maxRounds?, maxCalls?, maxTokens?, stop?, approvals?,
-                       #   limits?, compact?, export?, wake?};
+                       #   limits?, compact?, export?, wake?, invoke?};
                        #   content runs a turn; model-only calls persist/resolve
                        #   selection without inference; model present + empty clears
                        #   the conversation override. provider pins the conversation
@@ -557,6 +579,8 @@ svc.session.<id>.call  # session runner for conversation <id> (queue "session"):
                        #   approvals?/limits? are the human's mutable conversation
                        #   controls; compact? runs the compactor now (no turn);
                        #   export? returns the exact provider request (no turn);
+                       #   invoke? runs one tool through the runner's own gate
+                       #   (no turn — see "Client tool controls");
                        #   wake? runs a notice-only turn — see "Autonomous wake".
                        #   attachments? is a turn's dropped images — see
                        #   "Attachments (images in a turn)".
@@ -945,9 +969,10 @@ turns with `busy` — turns never nest.
 - Presence = connection; component death detected by core via NATS disconnect
   plus `reg.depart` (graceful) vs silence (crash). A Nim or Go SDK component
   whose connection stays unhealthy past `NIF_RECONNECT_GRACE_S` re-attaches —
-  it re-resolves the bus, rebuilds its subscriptions and re-publishes
-  `reg.publish` on the fresh connection — rather than requiring a process
-  restart (docs/MANUAL.md "Re-attaching after a bus outage").
+  it re-resolves the bus (every candidate must be answered by a core serving
+  this root, and no well-known port is guessed), rebuilds its subscriptions and
+  re-publishes `reg.publish` on the fresh connection — rather than requiring a
+  process restart (docs/MANUAL.md "Re-attaching after a bus outage").
 - Tool names are unique across the whole catalog — enforced by core at
   registration; conflicting registrations are refused in full. The LLM only
   sees tool names; core maps tool → component at dispatch. The namespace is deliberately
@@ -1014,6 +1039,14 @@ No transport-native cancellation in NATS. Two implemented cancel paths:
   request/reply callers that stop waiting only abandon the reply; the target
   work is not stopped. A generic `ev.cancel.<call-id>` subject remains a
   possible future addition.
+
+A stop applies to a turn that is running when it arrives, or not at all. A
+session call carrying `invoke` (a client tool control, not a turn — see
+"Client tool controls") therefore never consumes one: a stale `__cancel` left
+on the steer channel is discarded at the control's entry, and a control
+arriving while its approval waits is ignored rather than read as the human's
+verdict. Live turns keep the whole contract above, and a denial a human
+actually made still refuses the tool.
 
 ## Settlement notices
 
@@ -1136,9 +1169,101 @@ visibly moved on — without a human message. A declined or skipped wake
 leaves the notice pending for the next real turn (never lost); the human's
 next message resets the budget.
 
-The process-exited lane has no waker (a process notice is announced on the
-same subject but nothing wakes for it): its fallback remains the next turn's
-pull drain.
+The process-exited lane rides the same wake request as a subagent settlement
+(`components/processes` publishes `session {wake: true}` when a tracked child
+exits and again from its 10 s retry tick for a still-pending record), so an idle
+owner is woken under the same admission and budget. The notice is nevertheless
+recoverable without a wake: it stays pending until acknowledged, and the next
+real turn's pull drain delivers it. A record whose owning conversation has
+nobody attached is still folded on that conversation's next turn.
+
+**Client readback.** A human deciding whether to walk away needs the answer
+before the job finishes, so two readbacks carry it and no client derives it
+locally (the budget comes from stored history, and a client guess would promise
+a wake the runner then declines):
+
+- `catalog {op: list}` carries `maxWakes` — the instance-wide budget, `0` when
+  wakes are disabled;
+- `session {sessionId}` (the status readback) carries
+  `wake: {max, used}` — `used` counts the trailing wake turns since the human's
+  last message, i.e. what the next admission would check;
+- `process_list` rows carry `session` (the owning conversation, `""` for a direct
+  call with nobody to tell) and `notifies`.
+
+Together those answer "if this finishes, will THIS conversation come back to
+me?" for each running job: its owner is this conversation and the budget has
+room (yes), the budget is spent or wakes are disabled (no, until the human
+speaks), or the job belongs to another conversation or nobody (never). This is
+observability, not a guarantee: an admitted wake can still fail mid-turn, and
+the durable notice is the fallback.
+
+## Conversation sandbox policy (stage A: configured, not enforced)
+
+Human-only control op on the hidden `session` tool — deliberately absent from
+that tool's schema, so a model cannot reach it through dispatch:
+
+```json
+{"sessionId": "…", "sandbox": {"enabled": true,
+  "addRead": ["/abs/dir"], "addWrite": ["/abs/dir"], "remove": ["/abs/dir"],
+  "expectRev": 3}}
+```
+
+Every field is optional. `expectRev` is the revision the caller was looking at:
+a stale one is refused (`rev-conflict`) rather than overwriting another human's
+decision. Roots must be absolute, existing directories; `/` is refused outright;
+a write root also becomes a read root (an edit reads before it writes), while a
+read root stays read-only. Sandbox roots do not automatically modify the
+separate workspace `grantedroot` document. The write fence is an independent
+check and may still refuse a sandbox-approved root; adding or removing a
+sandbox root does not create or revoke a workspace grant. In particular, a
+read approval never creates a write grant. Read-only reach is recorded but not yet honored by
+components — that needs a read/write split in the workspace plumbing
+(stage B). `remove` refuses the
+conversation's own workspace, which every relative path resolves from.
+
+Refusals that are policy, not validation: a session whose durable
+`sessionmeta.parent` is set is refused with `human-only` — a subagent inherits
+its parent's policy at birth and may never widen or disable it — and a lineage
+record that cannot be read is refused the same way, because unreadable is not
+root. This holds regardless of `approvals: auto` or `NIF_AUTO_APPROVE`, which
+decide who may run a call, not who owns a policy.
+
+Storage is its own document (`sandboxpolicy`, `<session>:policy`), not the
+conversation header: a security decision must not share the header's
+best-effort merge helper, and a compare-and-set write turns a lost race into a
+visible refusal. The status readback carries the whole policy plus
+`enforced: false` and `state: "configured"`.
+
+A tool opts into receiving the policy by declaring `x-harness.sandbox` in its
+schema (data, not a component-name list in core). When dispatch injects it, the
+tool receives `__sandbox` in its arguments — the policy plus `session`, `rev`,
+`persisted` and `enforced: false`. Incoming `__sandbox` is deleted first, so a
+caller cannot supply one, and a tool that does not declare the extension
+receives nothing. A direct bus call has no conversation therefore no policy; an
+unreadable policy arrives as an explicit `unreadable: true` marker rather than
+absent. The snapshot is cached ~2 s per conversation so a human update is seen
+promptly without a store read per tool call.
+
+**Experimental foreground `bash` guard on Linux.** Policy-driven calls opt
+into `__sandbox`. Before launching, the guard resolves the policy's deny
+patterns — exact basenames only, `.env` by default — to the concrete files under
+the workspace and WRITE roots and hands them to the launcher as masks; a glob,
+path or otherwise unsupported pattern refuses the launch, because masking
+nothing while reporting protection is worse than not running. Read-only roots
+still have no launcher vocabulary, so a policy naming one refuses before
+execution. For supported inputs, strict bwrap mounts selected runtime and
+writable roots rather than the host root; backend availability and actual
+launch are separate facts. No whole-conversation sandbox is claimed.
+
+**The filesystem tools are still unconfined by this document.** read, grep,
+edit, write and their siblings act under the workspace set, not the policy, so
+a conversation with `enabled: true` does not get a confined `read` — the
+promise above is about `bash` alone. Naming that here is deliberate: the
+release notes must not say "sandboxed" about a conversation whose edit tool
+still reaches anything the workspace set allows. `enforced` stays false for
+whole-conversation policy; see docs/research/SANDBOX-NEXT-SLICE.md. `sandbox_inherit
+{parent, sessionId, workspace}` is the hidden birth-path call a component uses
+to snapshot a parent's policy into a child; it is not a model-reachable tool.
 
 ## Subagent continuation (`agent_run`/`agent_spawn {session}`)
 
@@ -1222,17 +1347,29 @@ Hidden client tool `agent_fork {source, cwd, fork?}` copies completed history
 using the same balanced cut as a supervised fork, prepares a conversation and
 pins its workspace without starting a turn. It returns `sessionId`, `cwd`,
 `origin`, and `checkpointCopied:false`: compaction checkpoints are not copied;
-the new conversation receives raw completed history. It inherits neither the
-source's grants nor its provider/model selection. Hidden tools are unavailable
-through model discovery/invoke and nested session calls.
+the new conversation receives raw completed history. At birth it snapshots the
+source's explicit `providerOverride`/`modelOverride` selection through the
+runner's normal session controls, not the provider's serving/echo names. A
+source with no header yet (a fork seeds messages before one exists) has no
+selection to inherit and starts on the same defaults. Empty pins retain that
+default selection behavior. Later source changes do not propagate;
+the peer can change its own selection independently. Source selection read
+failures refuse the fork rather than silently choosing defaults. It does not
+inherit the source's grants or supervision. Hidden tools are unavailable
+through model discovery/invoke and nested session calls. New peers receive a
+normal `conv-…` session id; `agent-…` remains the supervised-subagent prefix,
+and existing ids are not renamed.
 
 Both peer and supervised forks record immutable `sessionmeta.origin`:
 `{session, atSeq, reason:"fork"|"worktree", worktree?:{path,branch,primary}}`.
 `atSeq` is the source message id at the balanced cut. Only supervised forks
-also record `parent`. Origin is provenance, never authority: it grants no
-continuation, approval routing, depth or idle-retirement relationship.
-`session_info` reports `origin` forward and a deduplicated `descendants` array
-backward (`{sessionId,supervised,origin?,fork?,closed?}`). `children` retains its
+also record `parent`. Origin is provenance, not supervision: it grants no
+continuation, approval routing, depth or idle-retirement relationship. Its sole
+authority is worktree retirement — a peer fork may remove only the exact tree
+its `origin.worktree` recorded creating, and core verifies that lineage from the
+store, never from a tool argument. `session_info` reports `origin` forward and a
+deduplicated `descendants` array backward
+(`{sessionId,supervised,origin?,fork?,closed?}`). `children` retains its
 supervision-only meaning.
 
 After a successful `git_merge`, the caller's origin receives a durable
@@ -1411,6 +1548,23 @@ header (`approvals`, `limits`), so a resumed runner re-applies exactly what
 the human last chose, and both are echoed by the status readback and the turn
 result (`approvals`, `limits`) for UIs. Invalid values are refused with a
 clear error (unknown mode, unknown limit key, out-of-range value).
+
+### Client tool controls
+
+`session {invoke: {tool, arguments}}` runs one ordinary tool through this
+conversation's runner gate, with no LLM turn. It exists for client actions that
+must carry conversation context — the TUI's `/worktree` verbs — because a direct
+`core.invoke` has no conversation context: worktree ownership would be recorded
+as unknown and a merge notice would have no origin to name.
+
+Workspace, approval mode and isolation are taken from the conversation for the
+duration of the call and restored afterwards, so approvals, write fences and
+session attribution behave exactly as they do for a model dispatch. The control
+is human-only: it is absent from the model-facing session schema, refused in a
+task-scoped (unattended) session, and hidden tools stay unreachable through the
+inner invoke. The reply is `{ok: true, result: <tool result>}`; malformed
+arguments answer `invoke needs tool and object arguments`. Because it runs no
+turn, it never consumes a stop — "Cancellation" states the rule.
 
 ### Attachments (images in a turn)
 
@@ -1870,7 +2024,11 @@ messages, `rank` orders by relevance, `snippet` marks the matched span.
   it in the same transaction, a startup disagreement re-derives it from the
   documents, and dropping it loses nothing. Consumers never see which index
   answered. The sqlite engine implements it with sqlite-vec (`vec0` tables
-  partitioned by kind and model, one table per vector width); the tidb
+  partitioned by kind, model and derived id prefix, one table per vector width).
+  Queries apply instance and literal `idPrefix` filters before exact cosine
+  top-k evaluation; arbitrary prefixes need not end at a partition boundary.
+  This preserves correct k without post-filter shortfalls, at filtered-scan
+  cost rather than an approximate-index performance guarantee. The tidb
   engine does not yet, and answers `code: "unsupported"` rather than
   pretending to have searched.
 - **Engines**: the sqlite engine (default) answers from an FTS5 index

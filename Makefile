@@ -107,7 +107,7 @@ SQLITE_VEC_INC = shim="$${TMPDIR:-/tmp}/niffler-sqlite-inc"; mkdir -p "$$shim"; 
 
 .PHONY: help all build components components-inner run down down-here \
          test test-server test-bench test-bash test-store test-store-tidb test-builder test-console test-plugins test-skills test-fetch \
-        test-models test-provider test-observe test-logfile test-hooks test-core test-discover test-cli test-jev test-von \
+        test-models test-embed-chain test-provider test-observe test-logfile test-hooks test-core test-discover test-cli test-jev test-von \
         test-systemprompt test-grep test-git test-edit test-expert test-mcp test-uireg test-heartbeat test-fleet-admission test-taskpolicy test-codingartifact test-server-lifecycle test-fleet \
         test-retry-unit test-ctx-accounting test-context-status test-compaction \
         test-toolpair-unit test-toolpair-heal test-dotenv test-dotenv-ts \
@@ -150,6 +150,8 @@ help-tests:
 	@echo '  test-go              Go unit tests + vet; race detector on audited packages'
 	@echo '  test-bench           Node benchmark unit tests; not a model eval, and not'
 	@echo '                       part of make test (they SIGKILL matched processes)'
+	@echo '  test-embed-chain     The embed-model chain: a provider record's embedModel'
+	@echo '                       reaches the models catalog (never the chat list)'
 	@echo '  test-clean           Cleanup contract only; no full build or live store access'
 	@echo '  test-fleet           Mocked provisioning tests; no real SSH/VM mutations'
 	@echo '  test-fleet-tasks     Two-instance task smoke (real bus/runners, mock model)'
@@ -242,7 +244,7 @@ var/bin/store-tidb: $(wildcard components/store-tidb/*.go) components/store-tidb
     $(wildcard components/store-tidb/migrations/*.sql) $(SDK_GO) | var/bin
 	$(BUILD_WRAP) bash -c 'cd components/store-tidb && go build -o ../../var/bin/store-tidb .'
 
-var/bin/bash: components/bash/main.nim $(SDK_NIM) $(NIM_CONF) | var/bin
+var/bin/bash: $(call NIM_SRCS,bash) $(SDK_NIM) $(NIM_CONF) | var/bin
 	$(BUILD_WRAP) nim c --hints:off $(NIMFLAGS) --path:sdk -o:$@ components/bash/main.nim
 
 var/bin/edit: components/edit/main.nim $(SDK_NIM) $(NIM_CONF) | var/bin
@@ -357,6 +359,9 @@ var/bin/systemprompt: components/systemprompt/main.nim \
 var/bin/recall: components/recall/main.nim $(SDK_NIM) $(NIM_CONF) | var/bin
 	$(BUILD_WRAP) nim c --hints:off $(NIMFLAGS) --path:sdk -o:$@ components/recall/main.nim
 
+var/bin/memory: components/memory/main.nim $(SDK_NIM) $(NIM_CONF) | var/bin
+	$(BUILD_WRAP) nim c --hints:off $(NIMFLAGS) --path:sdk -o:$@ components/memory/main.nim
+
 var/bin/compaction: components/compaction/main.nim $(SDK_NIM) $(NIM_CONF) | var/bin
 	$(BUILD_WRAP) nim c --hints:off $(NIMFLAGS) --path:sdk -o:$@ components/compaction/main.nim
 
@@ -441,11 +446,11 @@ components:
 components-inner: check-nim-deps var/bin/niffler var/bin/session var/bin/store-sqlite var/bin/store-tidb var/bin/bash \
 	var/bin/niffler-sandbox \
 	var/bin/edit var/bin/locks var/bin/lsp var/bin/repomap var/bin/processes var/bin/heartbeat var/bin/fleet var/bin/grep var/bin/git \
-	var/bin/builder var/bin/plugins var/bin/config var/bin/skills var/bin/fetch var/bin/jev var/bin/von \
+	var/bin/builder var/bin/plugins var/bin/config var/bin/skills var/bin/fetch var/bin/jev var/bin/von var/bin/local-embed \
 	var/bin/observe var/bin/logfile var/bin/console \
 	var/bin/cli var/bin/llm-openai var/bin/models var/bin/provider var/bin/llm \
 	var/bin/agent var/bin/expert var/bin/fabric var/bin/fabric-exec var/bin/systemprompt \
-	var/bin/recall var/bin/compaction \
+	var/bin/recall var/bin/memory var/bin/compaction \
 	var/bin/hooks var/bin/nats-server \
 	var/bin/mcp var/bin/mcp-bridge
 
@@ -557,7 +562,10 @@ TEST_BINS := $(patsubst tests/%.nim,var/bin/test_%,$(TEST_NIM))
 # them per sandbox started a dozen concurrent `nim c` runs per pooled gate and
 # those died under load without any compiler output (issue #108, deterministic
 # in CI). Not part of `build` — they are fixtures, not shipped components.
-FIXTURE_BINS := var/bin/fixture-skills-baked var/bin/fixture-fleet-fault-store var/bin/ctxtest var/bin/ctxsink var/bin/fixture-mock-llm var/bin/fixture-compaction var/bin/fixture-mcp-server var/bin/fixture-slow-lsp var/bin/fixture-image-tool
+FIXTURE_BINS := var/bin/fixture-skills-baked var/bin/fixture-fleet-fault-store var/bin/ctxtest var/bin/ctxsink var/bin/fixture-mock-llm var/bin/fixture-compaction var/bin/fixture-mcp-server var/bin/fixture-slow-lsp var/bin/fixture-image-tool var/bin/fixture-embed-source
+
+var/bin/fixture-embed-source: tests/fixtures/embed_source.nim $(SDK_NIM) $(NIM_CONF) | var/bin
+	$(BUILD_WRAP) nim c --hints:off $(NIMFLAGS) --path:sdk -o:$@ tests/fixtures/embed_source.nim
 
 var/bin/fixture-fleet-fault-store: tests/fixtures/fleet_fault_store.nim $(SDK_NIM) $(NIM_CONF) | var/bin
 	$(BUILD_WRAP) nim c --hints:off $(NIMFLAGS) --path:sdk -o:$@ tests/fixtures/fleet_fault_store.nim
@@ -751,10 +759,30 @@ test-profile: build var/bin/test_t_profile ; $(TEST_LOCK) env "NIF_REPO_ROOT=$(R
 test-observe: build var/bin/test_t_observe ; $(TEST_LOCK) env "NIF_REPO_ROOT=$(ROOT)" "NIF_ROOT=$(ROOT)" ./var/bin/test_t_observe
 test-logfile: build var/bin/test_t_logfile ; $(TEST_LOCK) env "NIF_REPO_ROOT=$(ROOT)" "NIF_ROOT=$(ROOT)" ./var/bin/test_t_logfile
 test-recall:  build var/bin/test_t_recall  ; $(TEST_LOCK) env "NIF_REPO_ROOT=$(ROOT)" "NIF_ROOT=$(ROOT)" ./var/bin/test_t_recall
+test-memory:  build var/bin/test_t_memory  ; $(TEST_LOCK) env "NIF_REPO_ROOT=$(ROOT)" "NIF_ROOT=$(ROOT)" ./var/bin/test_t_memory
+# The end-to-end half: a real core + runner + memory, asserting a fact reaches a
+# conversation's PERSISTED transcript unasked, appended after the user message,
+# with the frozen system prompt untouched — and shared by a worktree.
+var/bin/test_t_memory_live: tests/t_memory_live.nim tests/helpers.nim $(SDK_NIM) $(CORE_NIM) \
+    var/bin/niffler var/bin/session var/bin/memory var/bin/fixture-mock-llm
+test-memory-live: build var/bin/test_t_memory_live ; $(TEST_LOCK) env "NIF_REPO_ROOT=$(ROOT)" "NIF_ROOT=$(ROOT)" ./var/bin/test_t_memory_live
+# Validation of the RETRIEVAL half: the store's vector path end to end (kNN
+# ordering, model isolation, honest refusals) and — pinned as a
+# regression test — scoped retrieval without cross-repository leakage
+# (docs/research/MEMORY.md §7). NIF_STORE_BACKEND=tidb asserts that engine's
+# explicit "unsupported" refusal instead.
+test-memory-vector: build var/bin/test_t_memory_vector ; $(TEST_LOCK) env "NIF_REPO_ROOT=$(ROOT)" "NIF_ROOT=$(ROOT)" ./var/bin/test_t_memory_vector
+# Validation of the ACCUMULATION half: selective collection (no automatic
+# transcript-to-facts extractor), provenance, the subagent write rule, and the
+# recall block reaching the persisted transcript without touching the prefix.
+test-memory-feed: build var/bin/test_t_memory_feed ; $(TEST_LOCK) env "NIF_REPO_ROOT=$(ROOT)" "NIF_ROOT=$(ROOT)" ./var/bin/test_t_memory_feed
 test-workspaces: build var/bin/test_t_workspaces ; $(TEST_LOCK) env "NIF_REPO_ROOT=$(ROOT)" "NIF_ROOT=$(ROOT)" ./var/bin/test_t_workspaces
 test-hooks:  build var/bin/test_t_hooks  ; $(TEST_LOCK) env "NIF_REPO_ROOT=$(ROOT)" "NIF_ROOT=$(ROOT)" ./var/bin/test_t_hooks
 test-uireg:  build var/bin/test_t_uireg  ; $(TEST_LOCK) env "NIF_REPO_ROOT=$(ROOT)" "NIF_ROOT=$(ROOT)" ./var/bin/test_t_uireg
 test-models:  build var/bin/test_t_models  ; $(TEST_LOCK) env "NIF_REPO_ROOT=$(ROOT)" "NIF_ROOT=$(ROOT)" ./var/bin/test_t_models
+
+test-embed-chain: build var/bin/test_t_embed_chain var/bin/fixture-embed-source
+	$(TEST_LOCK) $(TEST_ENV) ./var/bin/test_t_embed_chain
 test-llm-modelpin: build var/bin/test_t_llm_modelpin ; $(TEST_LOCK) env "NIF_REPO_ROOT=$(ROOT)" "NIF_ROOT=$(ROOT)" ./var/bin/test_t_llm_modelpin
 test-provider-pin: build var/bin/test_t_provider_pin ; $(TEST_LOCK) env "NIF_REPO_ROOT=$(ROOT)" "NIF_ROOT=$(ROOT)" ./var/bin/test_t_provider_pin
 test-provider: build var/bin/test_t_provider ; $(TEST_LOCK) env "NIF_REPO_ROOT=$(ROOT)" "NIF_ROOT=$(ROOT)" ./var/bin/test_t_provider
@@ -900,6 +928,29 @@ doctor:
 	else \
 		echo "  jev backend (Von): not installed (optional) — 'make install-jev', then 'make von-up'"; \
 	fi
+	@# The sandbox backend, probed the way the launcher probes it: a backend
+	@# that starts commands but confines nothing must not read as available.
+	@# Only meaningful once niffler-sandbox is built, so absent binaries report
+	@# "run make build" rather than a false OK.
+	@if [ -x var/bin/niffler-sandbox ]; then \
+		if out=$$(var/bin/niffler-sandbox probe < /dev/null 2>/dev/null | tail -1); then \
+			case "$$out" in \
+			*'"backend":"bwrap"'*) echo "  sandbox backend: bwrap — confined bash can promise reads AND writes confined";; \
+			*'"backend":"landlock"'*) echo "  sandbox backend: landlock — writes confined, reads UNCONFINED (see NIF_SANDBOX_ALLOW_DEGRADED)";; \
+			*) echo "  sandbox backend: UNAVAILABLE — $${out:-no answer}; a policy-enabled conversation will refuse to run bash";; \
+			esac; \
+		else echo "  sandbox backend: probe failed"; fi; \
+	elif [ -n "$(IS_LNX)" ]; then \
+		echo "  sandbox backend: unknown — var/bin/niffler-sandbox not built yet ('make build')"; \
+	else \
+		echo "  sandbox backend: n/a — Seatbelt (macOS) is not implemented; confined bash is Linux-only"; \
+	fi
+	@if [ -n "$(IS_LNX)" ] && command -v bwrap >/dev/null 2>&1; then \
+		if ! var/bin/niffler-sandbox probe < /dev/null 2>/dev/null | tail -1 | grep -q '"backend":"bwrap"'; then \
+			echo "     (bwrap is installed but unusable — on Ubuntu 23.10+ AppArmor blocks"; \
+			echo "      unprivileged user namespaces: 'make install-sandbox-profile')"; \
+		fi; \
+	fi
 	@echo "Then: make — then launch niffler-tui (the client) or ./var/bin/niffler (admin shell)"
 
 install-go:
@@ -941,6 +992,22 @@ install-sandbox-profile:
 uninstall-sandbox-profile:
 	@bash scripts/install-sandbox-profile.sh --uninstall $(if $(filter 1,$(SUDO)),--sudo,)
 
+.PHONY: install-embed embed-up embed-down test-memory-vector test-memory-feed test-memory-embed-chain
+install-embed:
+	bash scripts/install-embed.sh
+
+var/bin/local-embed: components/local-embed/main.nim $(SDK_NIM) $(NIM_CONF) | var/bin
+	$(BUILD_WRAP) nim c --hints:off $(NIMFLAGS) --path:sdk -o:$@ $<
+
+embed-up: var/bin/local-embed
+	./var/bin/cli call spawn '{"name":"local-embed","binary":"var/bin/local-embed"}'
+
+embed-down:
+	./var/bin/cli call remove '{"name":"local-embed"}'
+
+test-memory-embed-chain: build var/bin/test_t_memory_embed_chain
+	$(TEST_LOCK) env "NIF_REPO_ROOT=$(ROOT)" "NIF_ROOT=$(ROOT)" ./var/bin/test_t_memory_embed_chain
+
 install-jev:
 	@# The Von runtime behind the jev component (venv + von-sdk). Opt-in:
 	@# ~5.4 GB including CUDA wheels; model weights download on first serve.
@@ -966,15 +1033,23 @@ install-native-deps:
 	elif command -v apt-get >/dev/null 2>&1; then \
 		$(SUDO) apt-get update && \
 		$(SUDO) apt-get install -y build-essential curl ca-certificates git \
-			pkg-config libssl-dev; \
+			pkg-config libssl-dev bubblewrap; \
 	elif command -v dnf >/dev/null 2>&1; then \
 		$(SUDO) dnf install -y gcc gcc-c++ make curl ca-certificates git \
-			pkgconf-pkg-config openssl-devel; \
+			pkgconf-pkg-config openssl-devel bubblewrap; \
 	elif command -v yum >/dev/null 2>&1; then \
 		$(SUDO) yum install -y gcc gcc-c++ make curl ca-certificates git \
-			pkgconfig openssl-devel; \
+			pkgconfig openssl-devel bubblewrap; \
 	else \
 		echo "Unsupported Linux package manager; install a C/C++ toolchain, curl, git, pkg-config and OpenSSL development headers manually" >&2; exit 1; \
+	fi
+	@# bubblewrap is what makes a confined bash command possible on Linux
+	@# (sandbox/main.nim probes it and refuses when it is unusable). It is NOT
+	@# installed on macOS: it is a Linux-namespace tool, and the macOS answer is
+	@# Seatbelt, which is not implemented yet — so there is deliberately no
+	@# Homebrew line here pretending otherwise.
+	@if [ -n "$(IS_LNX)" ] && ! command -v bwrap >/dev/null 2>&1; then \
+		echo "  note: bubblewrap did not install — confined bash will refuse"; \
 	fi
 
 install-nim:

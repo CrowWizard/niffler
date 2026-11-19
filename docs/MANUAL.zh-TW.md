@@ -56,7 +56,7 @@
 | `manifest.yaml` | 啟動 manifest：core 生成哪些元件、重啟原則，以及選用的無狀態 `replicas` 數量；`--minimal` 將其篩選為 `store`、`bash` 和 `llm` |
 | `var/` | **執行時狀態與建置產物，gitignored** — 包含持久儲存和基準資料，不可整體刪除 |
 | `var/bin/` | 建置的二進位檔（系統 core ＋會話執行器＋元件），加上 `builder.build` 編譯的一切 — 代理建置的元件也落在此處，與系統元件並列。由 `make build` 重建 |
-| `var/store.db` | 儲存的資料檔（SQLite 是唯一檔案型引擎）— **單一寫入者**：恰好一個 `store` 行程可以開啟它，並鎖定 `var/store.db.lock`（flock，行程崩潰時由核心釋放）。0.4.0 之前的 `var/barrel-db` 會在啟動時被拒絕，絕不會被覆寫 |
+| `var/store.db` | 儲存的資料檔（SQLite 是唯一檔案型引擎）— **單一寫入者**：恰好一個 `store` 行程可以開啟它，並鎖定 `var/store.db.lock`（flock，行程崩潰時由核心釋放）。Core 還會在該 store 訂閱之前拒絕第二個 `store` PID 的匯流排准入（協作式，因此請一起升級並重新啟動 core 與 store；從不請求准入的舊二進位無法被隔離）。0.4.0 之前的 `var/barrel-db` 會在啟動時被拒絕，絕不會被覆寫 |
 | `var/nats-url` | 最後生成的匯流排的匯流排位址；UI 橋接讀取它以找到 core |
 | `var/nats-monitor-url` | 當 core 生成匯流排時的 HTTP 監控端點；對於重用/遠端匯流排則不存在 |
 | `var/logs/`、`var/captures/` | 輪替的結構化日誌和明確的 observe 探針匯出（見[觀察與日誌](#observation-and-logs)） |
@@ -237,6 +237,8 @@ stdin/stdout tty（`make run`）是**管理 shell**，不是會話 UI：它只�
 
 檔案型引擎（`sqlite`）以相同方式強制單一寫入者：一個行程擁有該檔案（flock；行程崩潰時由核心釋放），其他所有行程只講 envelope。`tidb` 沒有可鎖的檔案——叢集按設計就是共享狀態，列鎖加上 rev 計數器在多個 harness 之間仲裁。
 
+無論使用哪個引擎，core 每條匯流排只接納一個 `store` 行程：兩個引擎都會在訂閱前請求准入，第二個 store PID 會被拒絕並中斷連線——即使它來自另一個 root 並擁有自己的資料檔（見 [WIRE.md](WIRE.md)「Subjects」）。
+
 `list` 是**一頁**，不是完整檢視：`limit` 預設為 100，並被限制在 1000 以內，回覆帶有 `hasMore` 以及 `nextAfter` id 游標。將 `nextAfter` 作為 `after` 傳回以走完其餘部分——`after` 為排他性，而當 `hasMore` 為 false 時 `nextAfter` 不存在。儲存保留完整歷史，因此一段長對話無法容納於單次呼叫；core 自身的全 kind 讀取（resume、`session_info`、`conversation_delete`）會自動分頁。
 
 儲存契約是對每個引擎執行同一套測試：`make test-store`（預設引擎）、`make test-store-tidb`（需要 `NIF_STORE_TIDB_DSN`，否則印出 SKIP）；`t_store_paging` 釘住 resume 與 migration 所依賴的 `after`/`hasMore`/`nextAfter` 游標語意。
@@ -334,7 +336,7 @@ Niffler 沒有單一設定檔。環境用於啟動決策，儲存文件與對話
 | `NIF_LSP_BIN_DIRS` | 在 PATH 之外搜尋伺服器二進位檔的額外目錄（以冒號分隔；開頭的 `~` 表示你的 home 目錄） | — |
 | `NIF_TRAFILATURA` | Trafilatura 執行檔路徑/名稱；`off` 停用外部擷取 | auto-detect `trafilatura` on `PATH` |
 | `NIF_LOG_LEVEL` | SDK 結構化日誌發布閾值（`debug`、`info`、`warn`、`error`） | `info` |
-| `NIF_RECONNECT_GRACE_S` | Nim 或 Go SDK 元件在匯流排不可達時容忍的秒數，超過後**重新接入**：重新解析 URL（`NIF_NATS_URL` → `$NIF_ROOT/var/nats-url` → 眾所周知的連接埠，因此在新連接埠上重啟的 core 也能被找到）、重新撥號（Nim 採指數退避）、重建每個訂閱並重新發佈 `reg.publish`。刻意高於 NATS 用戶端自身的重連預算（約 2 分鐘），因此更短的中斷絕不觸發它；不是正數的值會保留預設值。TypeScript SDK 目前尚不重新接入 | `180` |
+| `NIF_RECONNECT_GRACE_S` | Nim 或 Go SDK 元件在匯流排不可達時容忍的秒數，超過後**重新接入**：重新解析 URL（`NIF_NATS_URL` → `$NIF_ROOT/var/nats-url`——絕不猜測眾所周知的連接埠）、在訂閱前驗證回應的 core 服務此 root、重新撥號（Nim 採指數退避）、重建每個訂閱並重新發佈 `reg.publish`；被拒絕的候選會在下一輪探索中重試，而不會被加入。刻意高於 NATS 用戶端自身的重連預算（約 2 分鐘），因此更短的中斷絕不觸發它；不是正數的值會保留預設值。TypeScript SDK 目前尚不重新接入 | `180` |
 | `NIF_NATS_DIAL_TIMEOUT` | Go SDK 元件首次 NATS 握手（以及重新接入）允許的秒數。透過 `ssh … incus exec … cli relay` 到達的中繼匯流排，在 INFO 到達前需付出行程啟動加上全新 TCP 連線的成本，nats.go 預設的 2 秒無法滿足；1–600 的值會被採用，其他值保留預設值 | `15` |
 | `NIF_LLM_MAX_RETRIES` | 對暫時性 LLM 失敗（429/5xx/超載/連線中斷）的額外嘗試次數，採指數退避；每次重試會宣告 `ev.session.<id>.retry`。驗證/配額/錯誤請求錯誤一律快速失敗 | `2` |
 | `NIF_LLM_MAX_STREAM_RETRIES` | 串流回應中途中斷時的額外嘗試次數——與一般情況分開編列預算，因為中斷的串流可能已經計費輸出 | `2` |
@@ -392,6 +394,7 @@ Niffler 沒有單一設定檔。環境用於啟動決策，儲存文件與對話
 | `NIF_WRITE_MAX_BYTES` | `write` 工具整檔 payload 的上限 | `900000` |
 | `NIF_OAUTH_CALLBACK_HOST` | 本機 OAuth 回呼監聽器的主機（埠固定為 1455/53692） | `127.0.0.1` |
 | `NIF_LOG_MAX_MB` | core 在 `var/logs` 的子行程日誌保留上限（MB） | `200` |
+| `NIF_LOG_ROTATE_MB` | `var/logs` 中單一檔案的上限；超過後輪轉為 `<name>.log.1`（保留一代） | `5` |
 | `NIF_LOG_RETENTION_DAYS` | core 掃掠前保留子行程日誌的天數 | `7` |
 | `NIF_SPAWN_WAIT_MS` | `core.spawn` 在使呼叫失敗前，等待新元件在目錄中註冊的時間（限制 250–120000）；當目錄記錄到拒絕時等待會提早結束，因此此旋鈕只約束沉默的元件 | `5000` |
 
@@ -1390,12 +1393,12 @@ git worktree 是同一儲存庫的第二個檢出。Niffler 將其視為一等�
 工作樹寫入序列化），而且除非加上忽略規則，它會弄髒 `git status` —— 同層目錄兩者都不需要。
 此佈局不可設定。
 
-以已宣告的設定 `git.mutations`（或 `NIF_GIT_MUTATIONS=1`）啟用變更動詞；
-未啟用時只註冊讀取工具：
+變更動詞在已宣告的設定 `git.mutations`（或 `NIF_GIT_MUTATIONS`）開啟時註冊；
+該設定預設開啟，關閉後只註冊讀取工具：
 
 | 工具 | 審批 | 作用 |
 |---|---|---|
-| `git_worktree_list {repo?}` | 無（讀取） | 每個工作樹：路徑、分支、HEAD、鎖（及原因）、是否可清理、是否為呼叫來源樹，以及（來自歸屬帳本）哪個對話建立了它 |
+| `git_worktree_list {repo?, status?}` | 無（讀取） | 每個工作樹：路徑、分支、HEAD、鎖（及原因）、是否可清理、是否為呼叫來源樹，以及歸屬帳本中的建立對話。`status: true` 額外回報每棵樹的 `clean`/`changed`/`untracked` 和相對 primary 目前分支的 `ahead`/`behind`（`compare`）；每棵樹多執行兩次 git |
 | `git_worktree {op, repo?, name?, path?, branch?, base?, force?, delete_branch?}` | 一律 | `add` 從 `base`（預設為 primary 目前分支）切出 `<repo>.wt/<name>`、上鎖並記錄歸屬；`remove` 回收工作樹；`prune` 清除已手工刪除的工作樹記錄 |
 | `git_merge_preview {repo?, into?, from_ref?}` | 無（讀取） | 以 `git merge-tree` 計算合併結果而不觸碰工作樹：乾淨（含 `ahead`/`behind` 與 stat）或衝突路徑 |
 | `git_merge {op, repo, into?, from_ref?, strategy?, allow_dirty?}` | 一律 | `start` 合併至目前檢出的分支；`abort` 撤銷衝突中的合併 |
@@ -1417,7 +1420,9 @@ git worktree 是同一儲存庫的第二個檢出。Niffler 將其視為一等�
 
 對話的*工作區集合*是它的 primary 加上屬於同一專案的各工作樹；寫入圍籬放行整個集合，
 因此預設情況下工作樹中的對話也能寫 primary。`isolation: "worktree"` 把**宣告**集合
-收窄為對話自身的工作樹，因此對 primary 的寫入會以既有的 `[E_WRITE_OUTSIDE]` 拒絕。
+收窄為對話自身的工作樹加上任何顯式的 `/roots` 授權，因此對 primary 之類的自動探索樹的
+寫入會以既有的 `[E_WRITE_OUTSIDE]` 拒絕。授權在隔離下保留，因為這兩類根是不同的事實：
+探索是自動的，而授權是本對話中人類的明確決定（`claimRootsFor` 把對話自己的樹放在首位）。
 
 - **僅限人類。** 與 `roots` 一樣不在 `session` 工具 schema 中，所以模型無法自行放寬或收窄範圍。
 - **沒有可隔離對象時拒絕。** 工作區是普通檢出或子模組的對話會被拒絕並說明原因，
@@ -1426,6 +1431,11 @@ git worktree 是同一儲存庫的第二個檢出。Niffler 將其視為一等�
   拒絕它們會把工作樹變成牢籠。
 - **它是圍籬，不是互斥鎖。** 同一棵樹中的兩個對話仍可在不同檔案上並行 ——
   `locks` 保持路徑分條。
+- **兩個生命週期呼叫獲得一次性 primary 宣告。** `git_merge` 與
+  `git_worktree {op: "remove"}` 宣告 `writes: {"primary": true}`：只有當呼叫的
+  `repo` 恰好解析為對話所連結的 primary 檢出時，core 才為本次呼叫租用該根。
+  它不改變任何 root 授權、`isolation` 狀態或 bash/edit 圍籬，審批與鎖競爭仍然適用。
+  其他儲存庫、同層樹與 primary 子目錄仍會被拒絕（WIRE.md「x-harness schema extensions」）。
 
 持久化於 header 中，恢復時還原，呼叫之間可變，並在對話狀態回讀與
 `session_info.workspace` 中回報為 `isolation`。
@@ -1448,13 +1458,17 @@ git worktree 是同一儲存庫的第二個檢出。Niffler 將其視為一等�
 ### 溯源（`origin`）與合併通知
 
 由另一對話歷史播種的對話會記錄 `sessionmeta.origin = {session, atSeq, reason, worktree?}`。
-它**只是溯源，絕非權限**：不授予續行權、不路由審批、不豁免深度、不做閒置退休。
+它**只是溯源，不是監督**：不授予續行權、不路由審批、不豁免深度、不做閒置退休。
+唯一的例外是工作樹退休 —— 對等分叉可以移除其記錄的 `origin` 為它建立的那棵確切工作樹，
+依據儲存而非工具參數校驗；無關對話、同層樹、髒樹與未合併的工作仍會被拒絕。
 *受監督*的分叉（`agent_spawn {fork}`）同時帶有兩條邊 —— 監督用 `parent`、溯源用
 `origin`；**對等**分叉（`agent_fork`，隱藏的客戶端工具）只帶有 `origin`，
-因為沒有任何東西在監督它。
+因為沒有任何東西在監督它。新的對等分叉使用普通的 `conv-…` 對話 id
+（`agent-…` 仍是受監督子代理的前綴），既有 id 不會被重新命名。
 
-`session_info` 向前回報 `origin`，向後回報 `descendants`（`{sessionId, supervised, origin?}`），
-所以「這次探索產生了什麼？」從起點出發只需一次呼叫。
+`session_info` 向前回報 `origin`，向後回報去重後的 `descendants` 清單
+（`{sessionId, supervised, origin?, fork?, closed?}`），所以「這次探索產生了什麼？」
+從起點出發只需一次呼叫。
 
 成功合併後，發起合併對話的 origin 會收到持久的 `worktreemerge` 記錄（來源、工作樹、
 分支、commit、檔案、目標分支）。它在父對話的下一個回合以機制訊息投遞 —— 父對話閒置時
@@ -2689,7 +2703,7 @@ await comp.requestEnvelope(subject, envelope, timeoutMs?)
 每個 SDK 都讓 NATS 執行主體比對，並只分派綁定至傳遞該訊息的訂閱的處理常式。這避免了先前的交叉乘積，即一次呼叫可能透過 call、event 與 tap 路徑多次傳遞。Nim 保持無回呼且無執行緒；Go 使用其現有的互斥鎖，而 TypeScript 使用其 promise 鏈。關機時，Go 會先排空訂閱（至其有界的關閉寬限期），然後停止每個元件的傳遞迴圈並等待每個仍在執行的處理常式完成，以保留欠給呼叫方的回覆——已接受但從未開始的呼叫會被拒絕，而不是被靜默丟棄；而 TypeScript 會等待已排入佇列的處理常式，且不會使明確關閉自身元件的處理常式死鎖。
 
 #### Re-attaching after a bus outage
-NATS 用戶端會透明地重連至相同 URL，但匯流排在其重連預算之後仍不可達——或 harness 在新連接埠上重啟——過去會讓元件**存活卻失聰**：訂閱不再傳遞，未送出 `reg.depart`，目錄仍公告著無人能觸及的工具，恢復只能靠殺掉行程。Nim 與 Go SDK 現在會監視連線健康（每 2 秒一次 `Flush` 探測），一旦連線不健康持續 `NIF_RECONNECT_GRACE_S`（預設 180 秒，刻意高於用戶端自身的耐心），便**重新接入**：重新解析匯流排 URL、重新撥號（Nim 採指數退避；Go 在其健康 tick 上重試）、重建每個訂閱（call、event 與 tap）並重新發佈 `reg.publish`——無需重啟行程。
+NATS 用戶端會透明地重連至相同 URL，但匯流排在其重連預算之後仍不可達——或 harness 在新連接埠上重啟——過去會讓元件**存活卻失聰**：訂閱不再傳遞，未送出 `reg.depart`，目錄仍公告著無人能觸及的工具，恢復只能靠殺掉行程。Nim 與 Go SDK 現在會監視連線健康（每 2 秒一次 `Flush` 探測），一旦連線不健康持續 `NIF_RECONNECT_GRACE_S`（預設 180 秒，刻意高於用戶端自身的耐心），便**重新接入**：重新解析匯流排 URL（`NIF_NATS_URL` → `$NIF_ROOT/var/nats-url`，絕不猜測眾所周知的連接埠）、在訂閱前用 core 公告的 root 驗證每個候選、重新撥號（Nim 採指數退避；Go 在候選被拒絕時會在其健康 tick 上繼續重試探索）、重建每個訂閱（call、event 與 tap）並重新發佈 `reg.publish`——無需重啟行程。匯流排已消失的元件會以「無處可去」明確失敗，而不會遷移到回應眾所周知連接埠的任何 harness 上。
 
 延遲公告的元件（Go SDK 的 `DeferAnnounce`，例如 `mcp-bridge`）必須在全新連線上重新發佈自己的契約，因為它可能在不健康期間已經漂移；以 `onReattached`（Go 為 `OnReattached`）註冊它。一般元件無需鉤子——重新接入已重新公告它們凍結的契約。TypeScript SDK 目前尚不重新接入。
 
@@ -3046,10 +3060,11 @@ core 及其元件使用中的種類（store 工具自身的 docstring 只列出
 
 後端是所選的引擎——預設為位於 `var/store.db` 的 SQLite，或
 DSN 共享的 TiDB 引擎（`NIF_STORE_TIDB_DSN`，無 flock——由資料列鎖與
-rev 計數器在 harness 之間仲裁）。**恰好只有一個行程擁有該檔案**——
-絕不要對同一個資料庫執行兩個以檔案為後端的 `store` 行程（對同一個
+rev 計數器在 harness 之間仲裁）。**恰好只有一個 `store` 行程服務一個
+harness**——絕不要對同一個資料庫執行兩個以檔案為後端的 `store` 行程（對同一個
 root 開機的第二個 core 就會這麼做；實驗時請使用暫存的 `NIF_ROOT`
-副本）。
+副本）。Core 在該 store 訂閱之前拒絕第二個 `store` PID 的匯流排准入，
+即使它來自另一個 root；這是協作式准入，因此請一起升級並重新啟動 core 與 store。
 
 `list` 是一頁，不是完整視圖（見 [Store engines](#store-engines)）：
 core 中所有必須看見整個種類的東西都走 `storeListAll`——
@@ -3282,3 +3297,5 @@ SSH 安裝可明確選擇 `service: "process"`。目標 Linux 主機需預先安
 它也不會使供應商的 SSH 閘道新增連接埠轉送能力；Fleet 任務透過 SSH 命令執行。
 只有實際節點 catalog 回應後才儲存已驗證 receipt。路由保留於私有 receipt，
 不改變模型的固定提示前綴，任務結果繼續附加到歷史。
+
+> 語義檢索：memory 驗證分支新增 `memory.embedProvider`，透過提供方嵌入模型查詢 SQLite 向量；空值使用文字排序，失敗時回退。`make install-embed` 安裝無需 Ollama 的本機 nomic，`make embed-up` 啟用監督啟動器；安裝本身不會啟動服務或修改提供方。自動召回仍是有界的常駐事實。詳見英文手冊 “Retrieval, honestly labelled”。

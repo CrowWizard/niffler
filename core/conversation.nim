@@ -22,12 +22,19 @@ import ../sdk/niffler/jsonx
 import ../sdk/niffler/agentdefs
 import catalog
 import compaction
+import notices
 import dispatch
 import admission
 import taskpolicy
 import ../sdk/niffler/codingartifact
+import ../sdk/niffler/sandboxpolicy
 import attachments
 import approval
+# The wake/notice rules live in a leaf module so `dispatch` (which publishes
+# the wake budget as an instance fact) can read the same one copy this loop
+# enforces; re-exported here because tests and components resolve them through
+# this module.
+export notices
 import supervisor
 import retry
 import workspace
@@ -294,6 +301,13 @@ type
                              ## store (kind grantedroot) rather than trusted
                              ## from here; this field is the in-memory view for
                              ## the status readback.
+    sandboxState*: SandboxPolicy
+                             ## This conversation's effective sandbox policy
+                             ## (session {sandbox}), from its own revisioned
+                             ## store document. STAGE A: it records the human's
+                             ## decision and is NOT consulted for confinement by
+                             ## any tool yet — every readback says
+                             ## `enforced: false` (SANDBOX-NEXT-SLICE.md).
     limitRounds*: int        ## the human's SOFT turn limits (/limit): when one
     limitTokens*: int        ## is reached the turn ASKS whether it may keep
     limitSeconds*: int       ## going (0 = unset). The scoping budgets above
@@ -871,39 +885,6 @@ proc outputReserve*(p: Persister): int =
   ## admission actually enforces; this is the Persister-shaped wrapper.
   outputReserveFor(p.ctxOutput)
 
-proc wakeBudget*(): int =
-  ## Consecutive autonomous wake turns a conversation may run before a real
-  ## user message must reset the budget (dsh's maxConsecutiveWakes). A wake
-  ## turn is a session call with `wake: true` that exists only to fold
-  ## pending background-settlement notices into an idle conversation. 0
-  ## disables wakes entirely. Exported for tests.
-  try: result = max(0, getEnv("NIF_AGENT_WAKES", "3").parseInt())
-  except CatchableError: result = 3
-
-proc noticeHoldEnabled*(): bool =
-  ## Whether a settlement that lands during a live turn holds that turn open
-  ## for one more step (docs/WIRE.md "Busy-parent inbox"): the would-stop
-  ## point drains notices exactly as it drains steer and advisories, so the
-  ## turn cannot close over a child that just finished. On by default;
-  ## `NIF_AGENT_NOTICE_HOLD=0` restores the plain next-turn pull (the
-  ## scripted bus-contract suites pin it off for deterministic round counts).
-  ## Exported for tests.
-  case getEnv("NIF_AGENT_NOTICE_HOLD", "1").strip()
-  of "0", "false", "no": false
-  else: true
-
-proc consecutiveWakeTurns*(messages: seq[JsonNode]): int =
-  ## How many wake-marked user messages trail the last real user input.
-  ## Machinery (subagent/process notices, mails) is skipped; the first
-  ## user message without a notice marker resets the count. Derived from
-  ## history rather than stored state, so it survives runner restarts and
-  ## needs no counter to lose. Exported for tests.
-  for i in countdown(messages.high, 0):
-    let m = messages[i]
-    if m{"role"}.getStr("") != "user": continue
-    if m{"notice"} == nil: return result
-    if m{"notice"}{"kind"}.getStr("") == "wake": inc result
-
 proc heartbeatMaxPerDay*(): int =
   ## Autonomous turns one heartbeat record may run per day. 0 disables
   ## heartbeats entirely (a scheduled-turn kill switch that leaves records and
@@ -938,6 +919,10 @@ proc consecutiveWakeTurnsFromStore(ct: CoreTools, sessionId: string): int =
   ## asked whether a message was a wake. One bounded store page is enough
   ## for the trailing run; an overflowing page only ever undercounts
   ## (conservative: at worst one extra wake is admitted).
+  ##
+  ## The rule itself is notices.consecutiveWakeTurns (one copy, shared with
+  ## the catalog fact a client reads); only this store read is conversation-
+  ## side, because it needs CoreTools.
   try:
     var records: seq[JsonNode] = @[]
     for item in ct.storeListItems("message", sessionId & ":", 1000, 10_000):
@@ -2087,15 +2072,27 @@ proc drainSteer(ct: CoreTools, p: var Persister, messages: var seq[JsonNode],
   ct.steerStream.queue.setLen(0)
 
 proc drainMapQueue*(queue: var seq[tuple[workspace, map: string]],
-                    appended: var bool): seq[tuple[workspace, map: string]] =
-  ## Consume only the map lane. Return at most one map per conversation;
-  ## later arrivals are discarded, never touching the diagnostic lane.
-  if appended:
-    queue.setLen(0)  # stale later maps must not be retained forever
-    return
-  if queue.len > 0:
-    result.add(queue[0])
-    appended = true
+                    appended: var HashSet[string]): seq[tuple[workspace, map: string]] =
+  ## Consume only the map lane. Return at most one map per call, and only for a
+  ## workspace this conversation has not been given a map for yet; later
+  ## arrivals are discarded, never touching the diagnostic lane.
+  ##
+  ## The dedupe key is the WORKSPACE, not the conversation. It used to be a
+  ## bare bool, which meant "one map per conversation lifetime": a conversation
+  ## that moved — `/worktree add`, `/worktree close`, an explicit
+  ## `session {cwd}` — kept the map of the tree it had left and described the
+  ## wrong files to the model for the rest of its life. A stale map is worse
+  ## than no map, because it is read confidently and nothing signals that it
+  ## is about another checkout.
+  if queue.len == 0: return
+  var chosen = -1
+  for i in 0 ..< queue.len:
+    if queue[i].workspace notin appended:
+      chosen = i
+      break
+  if chosen >= 0:
+    result.add(queue[chosen])
+    appended.incl(queue[chosen].workspace)
   queue.setLen(0)
 
 proc drainDiagnosticsQueue*(queue: var seq[tuple[path, text: string, clean: bool]]):
@@ -2128,6 +2125,41 @@ proc drainMap(ct: CoreTools, p: var Persister,
     if onEvent != nil:
       onEvent("map", %*{"sessionId": p.convId, "workspace": ws,
                         "bytes": map.len})
+
+proc drainMemory(ct: CoreTools, p: var Persister,
+                 messages: var seq[JsonNode],
+                 onEvent: proc(kind: string, data: JsonNode) {.closure.},
+                 force = false) =
+  ## Append the durable-memory recall block, once per conversation
+  ## (docs/research/MEMORY.md §4). The memory component decides WHAT is worth
+  ## sending and WHEN — the runner only appends, so the block is ordinary
+  ## append-only history and the frozen prefix is untouched.
+  ##
+  ## One block per conversation, deliberately: a later block would repeat facts
+  ## the model has already read, and the second copy costs context for nothing.
+  ## The exception is a compaction, which legitimately re-opens the window (the
+  ## facts it summarized away are exactly what memory should restore) — the
+  ## component re-publishes after a compaction and `appended` is cleared there.
+  if ct.memoryStream == nil: return
+  if force: ct.memoryStream.appended = false
+  if ct.memoryStream.queue.len == 0: return
+  if ct.memoryStream.appended:
+    ct.memoryStream.queue.setLen(0)
+    return
+  let text = ct.memoryStream.queue[0]
+  ct.memoryStream.queue.setLen(0)
+  ct.memoryStream.appended = true
+  let activity = %*{"id": "memory-" & newId(), "operation": "recall",
+    "phase": "applied", "sessionId": p.convId, "text": text,
+    "bytes": text.len, "createdAt": epochTime(), "injected": true}
+  if ct.activeTurn != nil and ct.activeTurn.id.len > 0:
+    activity["turnId"] = %ct.activeTurn.id
+  # Persist the display identity with the canonical message: reconnecting
+  # clients can reconstruct a memory block without parsing ordinary user prose.
+  let msg = %*{"role": "user", "content": text, "memory": activity}
+  ctxAppend(p, messages, msg)
+  if onEvent != nil:
+    onEvent("memory", activity)
 
 func diagnosticMessage*(path, text: string, clean: bool): JsonNode =
   ## Display-only clean verdicts never enter the model projection.
@@ -3569,6 +3601,29 @@ proc runTurn*(ct: CoreTools, p: var Persister, messages: var seq[JsonNode],
     if ct.activeTurn != nil:
       ct.activeTurn.session = ""
       ct.activeTurn.id = ""
+  # Task-entry semantic recall: only the first substantive request, not every
+  # turn/tool call. Missing memory is optional and must never fail a turn.
+  # Query recall remains append-only; the ordinary drain records its activity.
+  if ct.memoryStream != nil and not ct.memoryStream.appended and turnContent.strip().len > 0:
+    var priorRecall = false
+    for message in messages:
+      if message{"memory"} != nil or
+          message{"content"}.getStr("").startsWith("Durable memory for this workspace"):
+        priorRecall = true
+    if not priorRecall:
+      try:
+        let header = ct.storeGetItem("conversation", sessionId).value
+        let workspace = header{"cwd"}.getStr("")
+        let policy = ct.dispatchToolCall("memory_scopes", %*{"workspace": workspace}, 3000)
+        var recalled = newJObject()
+        if policy{"autoRecall"}.getStr("off") in ["birth", "both"]:
+          recalled = ct.dispatchToolCall("memory_recall", %*{
+            "workspace": workspace, "query": turnContent, "limit": 3}, 15_000)
+        let blockText = recalled{"block"}.getStr("")
+        if blockText.len > 0:
+          ct.memoryStream.queue = @[blockText]
+      except CatchableError:
+        discard
   # ---- authoritative per-turn accounting (docs/WIRE.md "Turn usage") ------
   # A LOCAL mirror, not the `var` out-parameter: the nested procs below
   # (emitTurnDone, finishTurn, endTurnOnLimit) may not capture a var parameter
@@ -3883,6 +3938,7 @@ proc runTurn*(ct: CoreTools, p: var Persister, messages: var seq[JsonNode],
     discard drainSteer(ct, p, messages, onEvent, turnId)
     drainMap(ct, p, messages, onEvent)
     drainDiagnostics(ct, p, messages, onEvent)
+    drainMemory(ct, p, messages, onEvent)
     discard drainAdvisories(ct, p, messages, onEvent, turnId)
     discard drainNotices(ct, p, messages, onEvent, turnId)
     # A conversation's direct schemas are immutable. New live capabilities
@@ -3915,6 +3971,7 @@ proc runTurn*(ct: CoreTools, p: var Persister, messages: var seq[JsonNode],
         discard drainSteer(ct, p, messages, onEvent, turnId)
         drainMap(ct, p, messages, onEvent)
         drainDiagnostics(ct, p, messages, onEvent)
+        drainMemory(ct, p, messages, onEvent, force = true)
         discard drainAdvisories(ct, p, messages, onEvent, turnId)
         verdict = checkContext(p, messages, onEvent, turnId, toolTokens)
         if verdict.startsWith("pressure:") and
@@ -4119,6 +4176,7 @@ proc runTurn*(ct: CoreTools, p: var Persister, messages: var seq[JsonNode],
               discard drainSteer(ct, p, messages, onEvent, turnId)
               drainMap(ct, p, messages, onEvent)
               drainDiagnostics(ct, p, messages, onEvent)
+              drainMemory(ct, p, messages, onEvent, force = true)
               discard drainAdvisories(ct, p, messages, onEvent, turnId)
               overflowVerdict =
                 checkContext(p, messages, onEvent, turnId, toolTokens)
@@ -4172,6 +4230,7 @@ proc runTurn*(ct: CoreTools, p: var Persister, messages: var seq[JsonNode],
                 discard drainSteer(ct, p, messages, onEvent, turnId)
                 drainMap(ct, p, messages, onEvent)
                 drainDiagnostics(ct, p, messages, onEvent)
+                drainMemory(ct, p, messages, onEvent, force = true)
                 discard drainAdvisories(ct, p, messages, onEvent, turnId)
               if readyAsIs or (ceiling > 0 and measure + outputReserve(p) <= ceiling) or
                   (ceiling <= 0 and measure < promptTokens):
@@ -4795,7 +4854,16 @@ proc repinWorkspace(ct: CoreTools, sessionId: string, entry: var Session,
   # read as "no request", which is the rule a client must not have to know —
   # omit the key to leave the workspace alone.
   if not explicit: return refusal
-  if resolved.path == entry.workspace: return ""  # nothing to do
+  if resolved.path == entry.workspace:
+    # Explicitly choosing the default is still a choice, even though there is
+    # no path change. Persist it so a later resume cannot silently move it.
+    if not workspaceChosen(ct, sessionId):
+      try:
+        ct.updateConversationHeader(sessionId,
+          %*{"cwd": entry.workspace, "cwdPinned": true})
+      except CatchableError as e:
+        return "cannot persist workspace: " & e.msg
+    return ""
   let hasTurns = conversationHasTurns(ct, sessionId)
   let pristine = not hasTurns and
     (entry.messages.len == 0 or
@@ -5084,6 +5152,18 @@ proc handleSessionCall*(ct: CoreTools, inputArgs: JsonNode,
   # write fence to the conversation's own tree; "shared" (the default) is
   # today's behaviour, unchanged.
   let hasIsolation = args.kind == JObject and args.hasKey("isolation")
+  # Conversation sandbox policy (docs/research/SANDBOX-NEXT-SLICE.md stage A).
+  # A content-less control call, human-only like `roots` and `isolation`:
+  # absent from the `session` tool schema, so a model cannot enable, disable or
+  # widen its own policy through the control channel. Persisted with a
+  # revision, so a stale concurrent edit is a refusal rather than a silent
+  # overwrite.
+  #
+  # THIS PERSISTS A DECISION; IT DOES NOT CONTAIN ANYTHING YET. Every readback
+  # reports `enforced: false`, because no tool consults the policy for
+  # confinement in this stage — claiming otherwise is exactly the "availability
+  # is not enforcement" mistake docs/PLAN.md opens 0.6.0 by forbidding.
+  let hasSandbox = args.kind == JObject and args.hasKey("sandbox")
   # Manual compaction (/compact): the human's explicit request for the same
   # replaceable-compactor rung the automatic ladder runs at pressure. Rides a
   # content-less control call like the other conversation controls.
@@ -5099,8 +5179,23 @@ proc handleSessionCall*(ct: CoreTools, inputArgs: JsonNode,
   if sessions.hasKey(sessionId):
     entry = sessions[sessionId]
     if hasCwd:
+      let before = entry.workspace
       let refusal = repinWorkspace(ct, sessionId, entry, args{"cwd"}.getStr(""), args)
       if refusal.len > 0: return %*{"error": refusal}
+      # A live conversation that MOVED must announce the new workspace, exactly
+      # as a freshly loaded one does below. Without this, components that key
+      # off workspace identity — repomap builds a map per workspace, lsp warms
+      # servers for the languages present — kept serving the tree the
+      # conversation had left: "the workspace is X but the repo map shown is
+      # from Y".
+      if entry.workspace != before:
+        try:
+          ct.nc.publish("ev.workspace.opened",
+            Envelope(v: 1, id: newId(), kind: ekEvent,
+                     payload: %*{"workspace": entry.workspace,
+                                 "conversationId": sessionId}).encode())
+        except CatchableError as e:
+          echo "core: WARNING workspace.opened publish failed: " & e.msg
   else:
     # The runner normally creates this at startup; keep the call idempotent
     # for direct/unit paths and load the persisted model selection from it.
@@ -5277,6 +5372,9 @@ proc handleSessionCall*(ct: CoreTools, inputArgs: JsonNode,
     entry.isolationScope = header{"isolation"}.getStr("").strip().toLowerAscii()
     if entry.isolationScope.len == 0: entry.isolationScope = "shared"
     if ct.nested != nil: ct.nested.isolation = entry.isolationScope
+    # An absent policy defaults to off; malformed or unreachable policy must
+    # fail this operation rather than silently disable confinement.
+    entry.sandboxState = ct.loadSandboxPolicy(sessionId, entry.workspace).policy
     let storedLimits = header{"limits"}
     if storedLimits != nil and storedLimits.kind == JObject:
       entry.limitRounds = storedLimits{"rounds"}.getInt(0)
@@ -5939,6 +6037,104 @@ proc handleSessionCall*(ct: CoreTools, inputArgs: JsonNode,
     if ct.nested != nil: ct.nested.rootsKey = ""
     entry.grantedRoots = capped
     ct.updateConversationHeader(sessionId, %*{"grantedRoots": capped})
+  if hasSandbox:
+    # stage A: persist the human's decision, enforce nothing yet.
+    #
+    # Accepted fields: `enabled` (bool), `addRead`/`addWrite` (path arrays),
+    # `remove` (path array), `expectRev` (int). Keep the granted-root path and
+    # this one from silently disagreeing: the workspace set the fence consults
+    # is derived from `grantedroot`, so a root added here ALSO goes there below.
+    # Sandbox policy changes are HUMAN-ONLY. A subagent inherits its parent's
+    # policy at birth and may never widen or disable it: a child that could
+    # turn confinement off would make the parent's decision advisory. The
+    # lineage fact comes from the store (sessionmeta.parent), not from anything
+    # the caller supplies — the same relation agent_run authorizes against.
+    #
+    # Refused for a child whatever `approvals: auto` or NIF_AUTO_APPROVE would
+    # have answered: approval decides who may run a call, not who owns a policy.
+    try:
+      let lineage = ct.storeGetItem("sessionmeta", sessionId).value
+      if lineage != nil and lineage.kind == JObject and
+          lineage{"parent"}.getStr("").len > 0:
+        return %*{"error": "sandbox policy is human-only: a subagent inherits " &
+          "its parent's policy at birth and cannot change it",
+          "code": "human-only"}
+    except CatchableError:
+      # Unreadable lineage is not permission: refuse rather than let an
+      # unverifiable caller edit a confinement decision.
+      return %*{"error": "sandbox policy is human-only and this caller's " &
+        "lineage could not be read", "code": "human-only"}
+    let raw = args{"sandbox"}
+    if raw.kind != JObject:
+      return %*{"error": "sandbox must be an object (enabled, addRead, addWrite, remove, expectRev)"}
+    for key in raw.keys:
+      if key notin ["enabled", "addRead", "addWrite", "remove", "expectRev"]:
+        return %*{"error": "unknown sandbox field " & key &
+          " (enabled, addRead, addWrite, remove, expectRev)"}
+    let current = ct.loadSandboxPolicy(sessionId, entry.workspace)
+    if raw{"expectRev"} != nil and
+        (raw{"expectRev"}.kind != JInt or raw{"expectRev"}.getInt(-1) < 0):
+      return %*{"error": "sandbox.expectRev must be a non-negative integer"}
+    if raw{"expectRev"} != nil and current.rev != raw{"expectRev"}.getInt(-1):
+      # The human edited from a stale view. Refuse rather than overwrite: the
+      # whole point of the revision is that a second decision is never lost.
+      return %*{"error": "sandbox policy changed since revision " &
+        $raw{"expectRev"}.getInt(0) & " (now " & $current.rev &
+        ") — reload and re-apply", "code": "rev-conflict",
+        "rev": current.rev}
+    var policy = current.policy
+    if raw{"enabled"} != nil:
+      if raw{"enabled"}.kind != JBool:
+        return %*{"error": "sandbox.enabled must be a boolean"}
+      policy.enabled = raw{"enabled"}.getBool()
+    # Sandbox roots are separate from workspace grants. Updating two store
+    # documents cannot be made atomic here; a partial sync could widen or leave
+    # stale write authority. The existing fence remains an independent check.
+    for key in ["addRead", "addWrite"]:
+      let list = raw{key}
+      if list == nil: continue
+      if list.kind != JArray:
+        return %*{"error": "sandbox." & key & " must be an array of paths"}
+      for item in list:
+        if item.kind != JString or item.getStr().strip().len == 0:
+          return %*{"error": "sandbox." & key & " entries must be nonempty path strings"}
+        let path = item.getStr().strip()
+        if path == "/":
+          return %*{"error": "refusing to approve the filesystem root as a sandbox root"}
+        if not path.isAbsolute():
+          return %*{"error": "sandbox roots must be absolute (got " & path &
+            ") — a relative path would depend on where the harness runs"}
+        let norm = normalizeRoot(path)
+        if norm.len == 0 or not dirExists(norm):
+          return %*{"error": "sandbox root is not an existing directory: " & path}
+        # A WRITE root implies the read root: confinement that permits a write
+        # but forbids the matching read could not apply an edit at all.
+        if key == "addWrite": policy.addGrant(norm)
+        elif norm notin policy.readRoots: policy.readRoots.add norm
+    let removing = raw{"remove"}
+    if removing != nil:
+      if removing.kind != JArray:
+        return %*{"error": "sandbox.remove must be an array of paths"}
+      for item in removing:
+        if item.kind != JString: continue
+        let norm = normalizeRoot(item.getStr().strip())
+        if norm.len == 0: continue
+        if norm == normalizeRoot(entry.workspace):
+          # The conversation's own workspace is not removable: every relative
+          # path, every tool's default and the runner's own cwd resolve from
+          # it. Refuse instead of producing a policy whose owner cannot work.
+          return %*{"error": "the conversation workspace cannot be removed from its own sandbox policy"}
+        policy.removeGrant(norm)
+    # Always CAS the revision we loaded, even when the caller did not supply
+    # one. An absent record uses the store's create-only sentinel (-1).
+    let saved = ct.saveSandboxPolicy(sessionId, policy,
+      expectRev = (if current.persisted: current.rev else: -1))
+    if not saved.ok:
+      return %*{"error": saved.error, "code": "rev-conflict"}
+    entry.sandboxState = policy
+    if ct.nested != nil: ct.nested.sandboxKey = ""
+    ct.updateConversationHeader(sessionId, %*{
+      "sandbox": %*{"enabled": policy.enabled, "rev": saved.rev}})
   if hasLimits:
     let raw = args{"limits"}
     if raw.kind != JObject:
@@ -6191,14 +6387,21 @@ proc handleSessionCall*(ct: CoreTools, inputArgs: JsonNode,
         return %*{"error": "invoke needs tool and object arguments"}
       let previousSession = ct.nested.session
       let previousWorkspace = ct.nested.workspace
-      let previousCaller = ct.approval.caller
+      let previousCaller = if ct.approval != nil: ct.approval.caller else: ""
+      let previousApprovalSession = if ct.approval != nil: ct.approval.session else: ""
       let previousMode = if ct.approval != nil: ct.approval.approvalMode else: ""
+      # Client controls run outside a turn. A previous stop must not poison
+      # their approval; queued controls are also ignored by the live-turn guard.
+      if ct.steerStream != nil:
+        pumpSteer(ct, discardControls = true)
+        ct.steerStream.cancelRequested = false
       let previousIsolation = ct.nested.isolation
       sessions[sessionId] = entry
       ct.nested.session = sessionId
       ct.nested.workspace = entry.workspace
       if ct.approval != nil:
         ct.approval.caller = caller
+        ct.approval.session = sessionId
         ct.approval.approvalMode = entry.approvalMode
       ct.nested.isolation = entry.isolationScope
       defer:
@@ -6206,7 +6409,9 @@ proc handleSessionCall*(ct: CoreTools, inputArgs: JsonNode,
         ct.nested.isolation = previousIsolation
         ct.nested.session = previousSession
         ct.nested.workspace = previousWorkspace
-        if ct.approval != nil: ct.approval.caller = previousCaller
+        if ct.approval != nil:
+          ct.approval.caller = previousCaller
+          ct.approval.session = previousApprovalSession
       return %*{"ok": true, "result": ct.dispatchToolCall("invoke", request)}
     var status = %*{
       "sessionId": sessionId,
@@ -6225,10 +6430,31 @@ proc handleSessionCall*(ct: CoreTools, inputArgs: JsonNode,
       # can say so beside the workspace row (and know that `session {cwd}` will
       # be refused once it IS a decision).
       "cwdPinned": workspaceChosen(ct, sessionId),
+      # Will a background settlement start a turn of its own? The answer is a
+      # FACT about this conversation, not a client guess: the budget is derived
+      # from stored history (notices.consecutiveWakeTurns), so a client cannot
+      # recompute it without paging the transcript, and a client that guessed
+      # would promise a wake the runner then declines. `used` counts trailing
+      # wake turns since the human's last message; `max` is 0 when wakes are
+      # disabled outright.
+      "wake": %*{"max": wakeBudget(),
+                 "used": consecutiveWakeTurnsFromStore(ct, sessionId)},
       "context": entry.persister.ctxSize,
       "promptTokens": entry.persister.promptTokens,
       "usedTokens": entry.persister.contextUsed
     }
+    # The conversation's sandbox policy (stage A): what the human chose, and
+    # explicitly that it is NOT enforced. "configured" and "applied" are
+    # different words on purpose — a readback that said "sandboxed" over a
+    # persisted-but-unenforced policy is the overclaim SANDBOX-NEXT-SLICE.md
+    # forbids, and "availability is never enforcement" is the rule 0.6.0 opens
+    # with.
+    block:
+      var sandboxJson = encodeSandboxPolicy(entry.sandboxState)
+      sandboxJson["enforced"] = %false
+      sandboxJson["state"] = %"configured"
+      sandboxJson["rev"] = %ct.loadSandboxPolicy(sessionId, entry.workspace).rev
+      status["sandbox"] = sandboxJson
     try:
       # overlay the resolved config onto the literal — do NOT reassign, or
       # session-local fields (sessionId, thinkingEffort, token counters) are lost
@@ -6551,6 +6777,14 @@ func diagSubject*(sessionId: string): string =
   ## — append-only, never the frozen prefix.
   "svc.session." & sanitizeSessionId(sessionId) & ".diag"
 
+func memorySubject*(sessionId: string): string =
+  ## The durable-memory recall channel: components/memory publishes a rendered
+  ## block of this workspace's facts here when it decides the conversation
+  ## should be told them unasked (its first turn, and again after a
+  ## compaction). The runner drains it (pumpMemory) and runTurn appends it as
+  ## history — append-only, never the frozen prefix (docs/research/MEMORY.md §4).
+  "svc.session." & sanitizeSessionId(sessionId) & ".memory"
+
 func adviseSubject*(sessionId: string): string =
   ## Turn-bound advisory requests from the expert peer (docs/research/EXPERT.md): answered
   ## by the runner's pumpAdvise with {accepted, reason}; advice never leaks
@@ -6563,13 +6797,29 @@ func toolSubject*(sessionId: string): string =
   ## live lease and re-enters the one dispatch gate (see dispatch.nim).
   "svc.session." & sanitizeSessionId(sessionId) & ".tool"
 
+proc runnerLive(ct: CoreTools, rname: string): bool =
+  ## True when `rname` is registered AND that registration still names a live
+  ## pid. A dead runner's leftover registration is a phantom: testing
+  ## presence alone makes the caller below skip the spawn, after which every
+  ## turn is published to a subject with no subscriber — the conversation
+  ## hangs with no error (conv-86b2545d9f27, 2026-10-14). Presence is the
+  ## readiness signal only while the process behind it exists.
+  if not ct.cat.components.hasKey(rname): return false
+  registrationAlive(ct.cat.components[rname])
+
 proc ensureRunner*(ct: CoreTools, sessionId: string): string =
   ## Return the scoped call subject for `sessionId`, spawning its session
   ## runner (a supervised child, policy never) if it is not alive. The
   ## runner announces itself as component "session-<id>" with 0 tools —
-  ## presence in the catalog is the readiness signal.
+  ## presence in the catalog is the readiness signal, once it names a live
+  ## process (runnerLive).
   let rname = runnerName(sessionId)
-  if not ct.cat.components.hasKey(rname):
+  if not ct.runnerLive(rname):
+    # Drop a registration whose pid is gone before judging readiness: it is
+    # not a child of ours to wait for, and letting it satisfy the test below
+    # is what strands the conversation. Nothing is running, so this only
+    # clears the stale entry (and announces it, so peers converge too).
+    discard ct.cat.dropPhantom(rname)
     var spawning = false
     for c in ct.sup.children:
       if c.name == rname: spawning = true
@@ -6595,15 +6845,15 @@ proc ensureRunner*(ct: CoreTools, sessionId: string): string =
       var spawning = false
       for c in ct.sup.children:
         if c.name == rname: spawning = true
-      if not spawning and not ct.cat.components.hasKey(rname):
+      if not spawning and not ct.runnerLive(rname):
         # the entry was reaped mid-wait: spawn the replacement now
         let bin = ct.root / "var" / "bin" / "session"
         if fileExists(bin):
           discard ct.sup.addChild(rname, bin, rpNever, @[sessionId])
           ct.sup.startChild(ct.sup.children[^1])
-    if ct.cat.components.hasKey(rname): break
+    if ct.runnerLive(rname): break
     sleep(100)
-  if not ct.cat.components.hasKey(rname):
+  if not ct.runnerLive(rname):
     raise newException(IOError,
       "session runner for " & sessionId & " did not come up")
   sessionSubject(sessionId)
@@ -6677,7 +6927,8 @@ proc pumpCoreCalls*(ct: CoreTools, sub: ptr natsSubscription) =
     try:
       case env.tool
       of "spawn", "catalog", "kill", "remove", "status", "discover", "ui",
-          "session_prepare", "session_info", "activity_list", "prompt_preview",
+          "session_prepare", "sandbox_inherit",
+          "session_info", "activity_list", "prompt_preview",
           "context_status", "doctor", "admission_get",
           "conversation_delete", "toolset", "profile":
         let r = ct.handleCoreTool(env.tool, env.args)

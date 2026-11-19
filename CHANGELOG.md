@@ -6,22 +6,150 @@ aims for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
+- Memory gains opt-in provider-backed semantic search/query recall, revision-checked
+  derived vectors and text fallback. SQLite filters instance and literal idPrefix
+  before exact cosine top-k. Subagent remember/forget writes now refuse.
+- Optional `make install-embed` installs llama.cpp plus SHA256-pinned nomic Q4
+  weights without Ollama; `embed-up`/`embed-down` control a supervised launcher.
+  Provider registration and memory configuration remain explicit.
 
-- New independent peer forks (including `/worktree add` forks) use `conv-…`
-  identifiers instead of the supervised subagent's `agent-…` prefix. Existing
-  conversations are not renamed.
-- Isolated worktree merge/close calls can lease their own primary checkout via
-  the declarative `writes.primary` flag, without widening bash/edit or root
-  grants. Peer forks can retire the exact origin-created tree recorded in their
-  durable lineage; foreign ownership, dirty-tree and unmerged-work guards remain.
+### Release overview
 
-- Canonical transcript writes are create-only: a stale continuation refuses
-  rather than overwriting an existing message. Full-kind reads reject malformed
-  pages and stalled cursors instead of accepting a partial transcript.
-- Conversation header updates use strict reads and compare-and-set retries,
-  preserving creation time, title and unrelated metadata across read failures
-  and concurrent updates. Header creation is also create-only.
+This development cycle adds a complete sibling-worktree workflow: create and
+isolate checkouts, fork peer conversations, review and merge their changes, and
+retire trees with ownership and safety checks. Client tool controls now use the
+runner's dispatch gate, including approvals and write arbitration. Workspace
+and grant inheritance also apply to subagents; worktree discovery stays outside
+frozen prompt prefixes.
+
+Reliability work protects transcript and header writes, distinguishes provider
+lookup failures from definitive misses, and prevents foreign-root components
+from sharing a harness's bus. These protections are cooperative boundaries, not
+OS-level sandboxing; see [Worktrees](docs/MANUAL.md#worktrees) and
+[Bus ownership](docs/research/BUS-OWNERSHIP.md).
+
+- **Close the bus recovery bypass and admit stores before serving.** Go and
+  Nim full re-attachment now check every candidate's root before subscribing
+  and never guess port 4222. Both shipped store engines request core admission
+  before taking calls; a second store PID is refused and disconnects, even from
+  the same root. Core records bounded timestamp/PID/root identity evidence for
+  arrivals, departures and refusals in rotating `core.log`, without using the
+  store. Upgrade/restart core and stores together: older cores cannot acknowledge
+  admission, and old components cannot be fenced by registration rejection.
+  Private-bus regressions cover recovery and rejection without call subscriptions.
+
+- **A component can no longer answer another harness's calls.** Symptom: with
+  several `niffler-tui` windows open, a conversation's pinned provider suddenly
+  "cannot be resolved", `/fav` listed nothing, and sessions failed on their own
+  transcripts — intermittently, and it read as data loss. The database was
+  intact every time: a component of a DIFFERENT root (a test root, a second
+  clone, a dev checkout) had attached to the same bus, and because a component's
+  call subject is a queue group named after the component, it answered a slice
+  of that harness's `svc.store.call` calls from another database. Two leaks fed
+  it — a component's connect path ended in a hardcoded
+  `nats://127.0.0.1:4222`, and the catalog trusted any `reg.publish`. Now a
+  component never invents a bus (the chain ends in an explicit failure), refuses
+  to stay on a bus whose core answers for a different root (`enforceBusRoot`,
+  before the subscribe — measured on a live harness: a foreign-root store merely
+  connected made `/fav` reads come back empty on 20 of 40 calls; with the guard,
+  0 of 40), and core refuses a registration whose announced root is not its own.
+  Interactive clients (which answer no tool subject) and root-less legacy
+  registrations stay accepted, the latter logged once. Details:
+  docs/research/BUS-OWNERSHIP.md.
+
+- **A `claudecode` bench lane measured, twice, across a Claude Code upgrade.**
+  The full31 suite on Synthetic DeepSeek V4.1 Flash (`/anthropic` gateway, low
+  effort, `jobs 1`) is 31/31 in round 1 with no invalid or leaked cells on both
+  Claude Code 2.1.286 and 2.1.318, so the suite is saturated for this model
+  through this harness and the numbers measure shape: **14.1 LLM messages per
+  task at ~0.5 tool calls each**, against Droid's 1.9 messages at ~4.4 — the
+  busiest caller in the set, and the most expensive lane on both cost bases
+  ($0.0231/task on Synthetic's catalog, $0.2208/run at first-party list
+  prices). The upgrade itself is a **prefix** saving, not a capability or speed
+  one: the first call's prompt fell 10 855 → 9 222 tokens (a deterministic
+  55-token spread across all 31 tasks) and per-task cost fell 15%
+  ($0.0271 → $0.0231) at identical wall clock (33.7 s), because Synthetic's
+  Anthropic endpoint bills every prompt token as a cache write at the prompt
+  rate, so cost tracks prefix size × calls. The newer build ships two *more*
+  tools (`Monitor`, `ToolSearch`) in a prefix 15% smaller. Reports in
+  `bench/reports/full31-syn-ds41-claudecode-{2318,j1}-report.*` and
+  `full31-syn-ds41-claudecode-analysis.md`.
+
+### Added
+
+- **Long-term memory, scoped per repository** (`components/memory`, optional):
+  durable facts a conversation chooses to keep, so a later conversation in the
+  same repo does not rediscover them. The scope key is the repository's
+  **primary** checkout, so every `git worktree` of it shares one memory instead
+  of starting blank. One live fact per **subject** — re-remembering updates it
+  and keeps the prior text as a revision — with `forget` archiving rather than
+  destroying, and staleness as a ranking signal rather than a delete. Facts
+  reach the model through a new append-only `svc.session.<id>.memory` lane (the
+  shape the repo map and LSP diagnostics already use), so automatic recall never
+  touches the frozen prompt prefix; it fires at a conversation's first turn and
+  again after a compaction or trim. Seven on-demand tools
+  (`memory_remember`/`search`/`get`/`list`/`forget`/`recall`/`scopes`); retrieval
+  is local token-prefix ranking (`ranker: "text"`) because scoped vector search
+  needs one store-contract change. Write policy is fail-closed: `forget` and any
+  `global` write are approval-gated, credential-shaped text is refused, and
+  subagents may not write. Design and reasoning: `docs/research/MEMORY.md`;
+  contract test `tests/t_memory.nim`.
+- **Experimental conversation sandbox foundation.** A revisioned policy record
+  and private dispatch context exist, and a policy-enabled foreground Linux
+  `bash` launch now masks the policy's denied files (`.env` by default) while
+  running under strict bubblewrap reach. This is still not whole-conversation
+  confinement: filesystem and network-capable tools are not uniformly governed,
+  read-only roots refuse until the launcher can express them, and macOS
+  (Seatbelt) is unimplemented. See
+  [SANDBOX-NEXT-SLICE.md](docs/research/SANDBOX-NEXT-SLICE.md) for the remaining
+  acceptance gates.
+- **A background job can now say whether it will wake you.** The processes
+  component already pushes a completion to its owning conversation and requests
+  a bounded wake; nothing told a human whether that would happen for the job
+  they were about to walk away from. Three readbacks now answer it, and no
+  client re-derives the rule: `catalog {op: list}` carries `maxWakes`,
+  the session status readback carries `wake: {max, used}`, and `process_list`
+  rows carry their owning `session` plus `notifies`. `niffler-tui` renders the
+  answer beside its background badge (`bg 2 · wake 1/3`, and
+  `completion waits for your next message` once the budget is spent or wakes
+  are disabled) and marks every `/processes` row as notifying this
+  conversation, another one, or nobody. The wake rule moved to
+  `core/notices.nim` so the enforcing loop and the published readout share one
+  copy. WIRE.md's contradictory "the process-exited lane has no waker" paragraph
+  is corrected: it does request a wake, and the durable notice remains the
+  fallback when the wake is declined or fails.
+- Git worktree creation, listing, removal and pruning use a durable ownership
+  ledger; explicit commit, merge preview and merge tools complete the workflow.
+  Peer forks carry origin provenance and durable merge notices. Opt-in worktree
+  isolation narrows writes while retaining reads and explicit human grants.
+- Client tool controls run through the session dispatch gate, and new worktrees
+  are discovered on subsequent dispatches. Subagents inherit the caller's
+  workspace and grants.
+- Store full-text search indexes tool-call arguments on SQLite and TiDB.
+  `scripts/provider-triage.sh` also captures store identity and binding for diagnosis.
+- `git_worktree_list {status: true}` reports each tree's cleanliness
+  (`clean`, `changed`, `untracked`) and its divergence from the primary's
+  current branch (`ahead`/`behind`, the compared ref named once as `compare`),
+  measured by running git in that tree. Opt-in because it costs two extra git
+  calls per tree; the default listing stays metadata-only.
+- **Worktree provenance, a peer fork, and durable merge notices.** Hidden
+  client tool `agent_fork {source, cwd, fork?}` copies completed history at the
+  same balanced cut as a supervised fork, without a parent/job edge or a turn,
+  and reports `checkpointCopied: false` because compaction checkpoints are not
+  copied. Peer and supervised forks record immutable `sessionmeta.origin`
+  provenance; `session_info` reports `origin` forward and a deduplicated
+  `descendants` list backward, while `children` keeps its supervision-only
+  meaning. A successful `git_merge` leaves the caller's origin a durable
+  `worktreemerge` inbox, read through hidden `git_merge_notices {session,
+  ack?}`, pushed to a busy origin and pulled on an idle origin's next turn,
+  and deduplicated against canonical history; a notification failure is a
+  warning on the already-successful merge, never a reason to replay it.
+- **A live worktree acceptance run.** `scripts/worktree-acceptance.sh` drives
+  the workflow against a live harness the way a client does — seeded
+  conversation, add, repin, isolate, fence both directions, commit, preview,
+  merge — and refuses to run against a core older than the source (exit 3).
+  `docs/WORKTREES-ACCEPTANCE.md` documents the scripted run, the six-step human
+  run for the client surface, and what each failure means.
 
 ### Changed
 
@@ -37,7 +165,13 @@ aims for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now 114/114/114, no broken anchors), and zh-TW's duplicate Simplified
   "Embeddings" section and five Simplified lines in the GitHub-token section
   are Traditional again.
-
+- **The worktree documentation now describes shipped behavior.** The tutorial's
+  Part 2 is rewritten as the primary workflow, with Part 1 reframed as the
+  manual fallback; the MANUAL gains a Worktrees section covering the verb table
+  and approval classes, the isolation fence, origin as provenance rather than
+  authority, the merge notice's commit/outbox gap, and the client surface.
+  `docs/FEATURES.md`, `docs/PLAN.md` and `docs/research/WORKTREES.md` record
+  all eight slices shipped, and the `zh`/`zh-TW` manuals are refreshed.
 - **The website now describes the 0.5.0 surface.** The feature section gained a
   Fleet card covering goal delegation to an Incus container, Lima VM or SSH
   host in `delegate` mode under the operator's ceiling; trust and safety gained
@@ -45,13 +179,91 @@ aims for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   mention human-granted extra roots; and ecosystem gained the discoverable
   per-component settings surface. All of it is localized in `en`, `zh` and
   `zh-TW`.
-
+- **The website's bench section names the full harness set.** It now lists Pi,
+  Opencode, DeepSeek Harness, CodeWhale, Droid and Claude Code in `en`, `zh` and
+  `zh-TW`, instead of only three.
 - **The READMEs no longer claim `make test` runs the bench adapter suite.**
   `make test` is documented as the complete code gate (bus-contract suite plus
   Go unit tests), with `make test-bench` as the separate, opt-in Node bench
   adapter suite that skips when Node is absent. The bench comparison list in
   `README.md`, `README.zh.md`, `README.zh-TW.md` and `bench/README.md` now
   names DeepSeek Harness and Droid.
+
+### Fixed
+
+- Core timestamps its lifecycle logs and checks `var/logs` at boot and hourly
+  for oversized files, retaining one rotated generation. `NIF_LOG_ROTATE_MB`
+  controls the per-file threshold; this is not a continuous hard size limit.
+- Explicitly selecting the already-default workspace now pins that choice, so a
+  later resume cannot silently move it; the existing post-turn immutability
+  rule still applies.
+- `jev` persists stale or failed shadow jobs with unknown candidates as JSON
+  null rather than crashing and entering a supervisor restart loop.
+- SQLite refuses an unbound database containing instance-owned rows when it
+  cannot establish the owner, rather than serving a misleading empty view.
+  Provider lookup now distinguishes a definitive not-found from a registry or
+  store failure; busy store reads get a retry rather than a false verdict.
+- Cancelling a running turn works again, and a stale idle steer cancellation
+  cannot abort the next turn. Worktree isolation preserves explicit human grants;
+  opaque write claims follow the actual target tree.
+- `read` select tolerates per-target errors and reports scan and output limits
+  instead of letting one unreadable file or a large tree hide other matches.
+- A multi-part message whose text part is empty is spelled safely on the wire
+  instead of reaching a strict OpenAI-compatible provider as `{"type":"text"}`.
+  Only empty text parts are rewritten; non-empty text and image parts pass
+  through unchanged, an image-only message does not gain a text part, and
+  stored history is not mutated.
+- **`make setup` installs bubblewrap, and `make doctor` reports the real
+  sandbox backend.** A fresh Linux clone got no confinement backend at all —
+  `install-native-deps` never asked for `bubblewrap` — so the first conversation
+  with a sandbox policy simply refused to run `bash`, with nothing in the
+  prerequisite report explaining why. `doctor` now probes the backend the way
+  the launcher does (a forbidden operation, not "does the binary exist") and
+  prints `bwrap` / `landlock` / `UNAVAILABLE`, pointing at
+  `make install-sandbox-profile` when AppArmor is blocking user namespaces on
+  Ubuntu 23.10+. macOS reports `n/a` rather than suggesting a brew package for a
+  Linux-namespace tool.
+- **A strict launch refuses a writes-only backend instead of degrading.**
+  Landlock confines writes and leaves reads open, so accepting it for a
+  conversation that asked to hide the host meant the one case where read
+  confinement matters ran with the host fully readable — visible only in a
+  status field. `NIF_SANDBOX_ALLOW_DEGRADED=1` still permits that degradation
+  for a *compat* launch, which never promised reads.
+- Worktree peer forks inherit the source conversation's provider/model pins
+  instead of starting with an empty selection. The pair is snapshotted at birth
+  and survives resume; later changes in either conversation remain independent.
+  Provider response/echo names are not substituted for selected model IDs.
+- Stale stop controls no longer deny `/worktree` and other client tool
+  approvals after a cancelled turn. Client tool approvals carry the conversation
+  identity, preserving per-conversation grants; live-turn cancellation and
+  explicit human denials remain enforced.
+- New independent peer forks (including `/worktree add` forks) use `conv-…`
+  identifiers instead of the supervised subagent's `agent-…` prefix. Existing
+  conversations are not renamed.
+- Isolated worktree merge/close calls can lease their own primary checkout via
+  the declarative `writes.primary` flag, without widening bash/edit or root
+  grants. Peer forks can retire the exact origin-created tree recorded in their
+  durable lineage; foreign ownership, dirty-tree and unmerged-work guards remain.
+- Canonical transcript writes are create-only: a stale continuation refuses
+  rather than overwriting an existing message. Full-kind reads reject malformed
+  pages and stalled cursors instead of accepting a partial transcript.
+- Conversation header updates use strict reads and compare-and-set retries,
+  preserving creation time, title and unrelated metadata across read failures
+  and concurrent updates. Header creation is also create-only.
+- **Write-path fields declared through `x-harness.writes.paths` are resolved
+  against the conversation workspace.** Both string and array forms (including
+  `git_commit`'s `paths`) now reach the component resolved, so an isolated
+  conversation is no longer refused `E_WRITE_OUTSIDE` for a file inside its own
+  tree — the documented `/worktree` merge flow would otherwise have broken for
+  every user.
+- **An isolated opaque writer outside its tree refuses instead of falling back
+  to the primary claim.** `roots: true` narrows to the conversation's own tree
+  and answers `E_WRITE_OUTSIDE`; an isolated bash with a cwd inside its tree
+  still works.
+- **Worktree isolation keeps the human's grants.** Isolation now drops only
+  automatically discovered roots, not `/roots add` grants, with the
+  conversation's own tree first; `session_info.workspace.writable` uses the same
+  rule as the write fence.
 
 ## [0.5.0] — 2026-10-29
 
@@ -550,7 +762,28 @@ approval-gated `store_claim`. The full list, with the reasoning, is in
   view and mark entries `embedding: true`; `models_list {embed: true|false}`
   filters on it, `models_providers` reports each provider's configured
   `embedModel`, and `models_sources` reports `embedModels`. A departed source
-  drops its patch and its models in one step, like a chat source.
+  drops its patch and its models in one step, like a chat source. The
+  configured-model half of that was inert on arrival: the catalog is projected
+  from the models.dev baseline file and never read provider records, so a
+  record's `embedModel` reached neither the embedding view nor
+  `models_providers.embedModel` — accepted by `provider_update`, echoed by
+  `provider_list`, and reported downstream as `model not found: <id>`. Fixed by
+  overlaying every provider record's configured model onto the baseline before
+  the projection, which also gives a provider the baseline has never heard of
+  (a local llama-server) a listable document;
+  `tests/t_embed_chain.nim` drives the real tools end to end instead of
+  supplying the field to a fixture. A third defect sat on the same path, one
+  component further out: `llm` decided a provider was usable by testing whether
+  its credential was non-empty, so a **keyless loopback provider was reported
+  as `unknown provider`** — refuting, at the routing boundary, the keyless-local
+  registration the provider component had just been taught to accept. The key
+  field is `omitempty` and an empty key is legitimate for a local llama-server,
+  so `provider_get` now states `hasKey` (the provider component's own
+  `hasCredential` verdict) and `llm` trusts it rather than re-deriving the
+  loopback rule in a second place. `tests/t_embed_chain.nim` covers the whole
+  chain — stored record, catalog view, `models_providers`, and routing — and
+  `docs/research/LOCAL-EMBEDDINGS.md` §8 measures the local install it enables
+  (llama.cpp + Q4_K_M GGUF = 107 MB, no daemon, 768 dims, verified end to end).
 
 - The resident user service now uses `Restart=always`. `Restart=on-failure`
   left a persistent instance stopped after a clean exit or SIGTERM (treated as

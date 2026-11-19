@@ -587,10 +587,15 @@ func envProvider(name string) (provider, string, error) {
 }
 
 type registryResponse struct {
-	Ok       bool   `json:"ok"`
-	Code     string `json:"code"`
-	Error    string `json:"error"`
-	Source   string `json:"source"`
+	Ok     bool   `json:"ok"`
+	Code   string `json:"code"`
+	Error  string `json:"error"`
+	Source string `json:"source"`
+	// HasKey is the provider component's own verdict on whether the record has
+	// a usable credential (provider.hasCredential). It exists because the key
+	// field is omitted when empty, and an empty key is legitimate for a
+	// loopback endpoint such as a local llama-server.
+	HasKey   bool `json:"hasKey"`
 	Provider *struct {
 		Nickname string `json:"nickname"`
 		AuthType string `json:"authType"`
@@ -736,7 +741,11 @@ func classifyProviderReply(raw json.RawMessage, err error) providerLookup {
 		credential = resp.Provider.OAuth.Access
 		accountID = resp.Provider.OAuth.AccountID
 	}
-	if credential == "" {
+	// A loopback provider has no key by design. Only the provider component can
+	// judge that (it owns the loopback rule), so trust its hasKey rather than
+	// re-deriving the rule here — a second copy would drift, and the first one
+	// (credential != "") was wrong for exactly this case.
+	if credential == "" && !resp.HasKey {
 		return providerLookup{}
 	}
 	source := resp.Source
@@ -820,8 +829,40 @@ func openAIMessages(messages []chatMessage) []openai.ChatCompletionMessage {
 // an empty ChatMessagePart.Text: an empty text part becomes {"type":"text"},
 // which strict providers reject (conv-d8e18e9fa617). Use an explicit, non-empty
 // marker instead. Assistant tool-call turns may still omit content.
+//
+// Two shapes need two guards, because they fail differently:
+//   - no content at all -> the "[empty message]" marker (a message with no
+//     content and no parts is what a strict provider calls missing content);
+//   - a parts message whose text part is empty -> that part must become
+//     spellable. Returning early on len(MultiContent) > 0 left it as
+//     {"type":"text"}, the very shape this function exists to prevent.
+//
+// Only EMPTY text parts are rewritten. A non-empty text part is content the
+// caller chose, and an image part is not text at all; rewriting either would
+// corrupt a real request to satisfy a validator. An image-only message must
+// not grow a text part either.
 func ensureContentKey(out *openai.ChatCompletionMessage, in chatMessage) {
-	if out.Content != "" || len(out.MultiContent) > 0 {
+	if len(out.MultiContent) > 0 {
+		// Copy on write. out is a struct copy of the caller's message, but
+		// MultiContent is a SLICE: the header is copied and the array is
+		// shared, so rewriting a part in place would mutate canonical
+		// history. Normalization is a wire concern only — the same reason
+		// the no-content path never touches in.
+		var fixed []openai.ChatMessagePart
+		for i, part := range out.MultiContent {
+			if part.Type == openai.ChatMessagePartTypeText && part.Text == "" {
+				if fixed == nil {
+					fixed = append([]openai.ChatMessagePart(nil), out.MultiContent...)
+				}
+				fixed[i].Text = " "
+			}
+		}
+		if fixed != nil {
+			out.MultiContent = fixed
+		}
+		return
+	}
+	if out.Content != "" {
 		return
 	}
 	if out.Role == openai.ChatMessageRoleAssistant && len(out.ToolCalls) > 0 {

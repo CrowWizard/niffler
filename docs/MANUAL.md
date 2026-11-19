@@ -29,6 +29,7 @@ outcomes, crash windows and the session-ID reuse restriction.
 - [Store engines](#store-engines)
 - [State and configuration](#state-and-configuration) · [Environment variables](#environment-variables) · [The `.env` file](#the-env-file)
 - [The bus in one screen](#the-bus-in-one-screen) · [Approvals](#approvals)
+- [Long-term memory](#long-term-memory)
 - [Shell guard and read masks](#shell-guard-and-read-masks)
 - [Context window](#context-window) · [Images (dropped and tool-produced)](#images-dropped-and-tool-produced) · [Self-extension and component lifecycle](#self-extension-and-component-lifecycle)
 - [Component ecosystem (`plugins`)](#component-ecosystem-plugins) · [Skills](#skills)
@@ -60,7 +61,7 @@ A one-file index of every shipped capability (not a reference) is
 | `manifest.yaml` | bootstrap manifest: which components core spawns, restart policy, and optional stateless `replicas` count; `--minimal` filters it to `store`, `bash`, `llm`, and `systemprompt` |
 | `var/` | **runtime state and build output, gitignored** — contains durable store and benchmark data; never delete wholesale |
 | `var/bin/` | built binaries (system core + session runner + components), plus everything `builder.build` compiles — agent-built components land here too, beside the system ones. Rebuilt by `make build` |
-| `var/store.db` | the store's data file (SQLite is the only file-backed engine) — **single-writer**: exactly one `store` process may open it, and it locks `var/store.db.lock` (flock, kernel-released on crash). A pre-0.4.0 `var/barrel-db` is refused at boot, never overwritten |
+| `var/store.db` | the store's data file (SQLite is the only file-backed engine) — **single-writer**: exactly one `store` process may open it, and it locks `var/store.db.lock` (flock, kernel-released on crash). Core also refuses bus admission to a second `store` PID before it subscribes (cooperative, so upgrade and restart core and stores together; legacy binaries that never ask are not fenced). A pre-0.4.0 `var/barrel-db` is refused at boot, never overwritten |
 | `var/nats-url` | bus address of the last spawned bus; the UI bridge reads it to find core |
 | `var/nats-monitor-url` | HTTP monitoring endpoint when core spawned the bus; absent for reused/remote buses |
 | `var/logs/`, `var/captures/` | rotating structured logs and explicit observe probe exports (see [Observation and logs](#observation-and-logs)) |
@@ -91,7 +92,7 @@ A one-file index of every shipped capability (not a reference) is
 | `locks` | Nim | optional | Cooperative write coordination for session-dispatched tools. File tools claim paths; wildcard paths claim their base directory; opaque writers claim a subtree. Read-effect tools and session-context orchestration take no outer claim: nested calls acquire individually. Conflicts return `E_WRITE_BUSY` naming the holder. Acquiring happens after approval; session leases last at least the transport timeout + 60 seconds (minimum 10 minutes). Terminal replies release; unknown timeout/cancel outcomes retain claims until expiry. Startup recovery is fail-closed and retryable; failed durable release retains the claim. The index is in memory, write-through to one store document per lease. Run one instance only (no replicas). Absent component means unarbitrated mode. Not an OS sandbox: direct bus calls, detached processes, native guest I/O and other harness instances are outside the guarantee. `lock_acquire`/`lock_release` are `hidden`: core's dispatch gate is their only caller and a model cannot invoke them — taking a lease is not a capability, it is what the gate does before a write. `lock_status` is on-demand, for diagnosing a refusal or an orphaned claim. See [WRITE-ARBITRATION.md](research/WRITE-ARBITRATION.md). |
 | `edit` | Nim | optional | the file tools: `read` (an image path — png/jpeg/gif/webp/bmp, recognized by its bytes rather than its extension — returns the image itself for the model to look at instead of the `E_NOT_TEXT` binary refusal, with a caption naming file, format, byte size and dimensions; over `READ_IMAGE_MAX_BYTES` (3.5 MB) the file is *reported*, never silently downscaled, and `capture`/`save_as` calls skip the image path entirely, so a var-capable call cannot smuggle pixels into a variable; see [Images](#images-dropped-and-tool-produced)); `read` (canonical `reads` array — up to 12 files/ranges in one call (per item 2000 lines, 256 KB, 2 KB per line — a longer line becomes a `bash: sed -n …` notice; 512000 bytes aggregate per call, the remainder reported as a per-item error that does not fail the batch), pageable, single-file `path` sugar; a whole read of a >1000-line file with a language server for its type returns the lsp symbol outline instead — window with offset/limit, or `offset: 1` to read whole anyway, `NIF_READ_OUTLINE_LINES` tunes/disables — a whole re-read of a file ≥512 bytes that this conversation already read in full and that is byte-identical returns `[unchanged] <path>: N bytes, M lines, digest <sha1>` instead of the text; `force: true` (or any offset/limit window) forces the re-dump, and windowed reads and small files always re-dump; a *select* item ({glob|path, pattern?, word?, context?, max?}) locates-then-fetches in one call — with no pattern it lists the matched paths like find/ls, while a literal pattern returns verbatim hit regions ±context lines (grep semantics) ready to copy into `edit`'s `old_string`; `glob` accepts `f*.go` (one directory), `**/*.go` (recursive) and `dir/**` (everything below that directory, not the whole root); one unreadable target (a binary, a directory, an oversized file) is a per-item `error` row in `items[]` and a `[skipped: …]` line in the text, never a failed batch; a zero-hit file is reported in `items[]` but does not spend the 64-file answer cap (so a pattern over a wide glob still reaches the hits), a glob past the 512-file scan cap and a call past the byte budget (192 KB of rendered regions per call) each add an explicit `[read limit: …]` notice, and a regex-shaped `pattern` that finds nothing gets a literal-match hint — matching itself is always grep -F), `edit` (only ever changes *existing* text files — a missing path is `E_NOT_FOUND`, an empty file `E_EMPTY`, both pointing at `write` as the way to create content; takes an `edits[]` array of `{old_string, new_string, replace_all?}` pairs — there is no separate multi-edit tool — all matched against the *original* file, checked for overlap and no-change, then written in one atomic rename; the guarded fallback cascade is trailing whitespace → indentation drift → unicode punctuation → block anchors by Levenshtein similarity ≥ 0.65 → double-escaped text, and every tier must still match exactly once; a staleness gate sits *before* matching — when the conversation's last-observed digest of the file differs from disk (an external edit, or a `bash` mutation since the read/write), `edit` refuses with `E_STALE` instead of matching text the model has never seen: re-read and redo. Session-less callers (`cli`, other components) are not tracked and skip the gate), `replace_across` (sed-style literal s///g across a bounded file set in one call — `paths` and/or `glob` (`f*.go` in one directory, `**/*.go` recursively), rules applied in order like a sed pipeline with an optional `word` (\b) span, every occurrence per file and zero-match files passing like sed; a zero *total* match is refused with `E_NO_MATCH` so a mistyped needle cannot silently succeed, per-file counts come back, and each changed file gets its own undo entry that `undo_last_edit` reverts individually; bounded by a 512-file glob-accident circuit breaker and a 32 MB per-call undo pre-image budget (`E_TOO_LARGE`) — the counting pass writes nothing until every refusal has passed), `write` (atomic whole-file: creates parent directories, follows symlinks, preserves the target's permissions, caps the payload at `NIF_WRITE_MAX_BYTES` = 900000), `undo_last_edit` (single-level per file — the previous edit only, not a stack — persisted across restarts and keyed by absolute path, reverting content, BOM and line endings exactly; refused with `E_UNDO_STALE` when the file was modified or deleted after the edit, in which case the stale record is *discarded* (re-read and edit forward); the undo record is written before the file, so a store failure refuses the edit with `E_UNDO_UNAVAILABLE` rather than losing the ability to revert; approval-gated mutations); `read`, `edit`, `replace_across` and `write` additionally carry the session-variable pipeline controls (`save_as` captures a response field, `resolve_vars: true` substitutes `$name` in that call's arguments — every other `$` stays literal; see [WIRE.md](WIRE.md) `x-harness.variables`); anchored block moves live in the [niffler-hashline](https://github.com/gokr/niffler-hashline) plugin |
 | `lsp` | Nim | optional | language-server seam: one `lsp` tool — `diagnostics` (compiler/lint errors without a test run), `documentSymbol` (file outline: every symbol with kind, name and one-based position), `workspaceSymbol` (repo-wide symbol search on the server's index — fuzzy `query`, cross-file results), `goToDefinition`, `findReferences`, `goToImplementation`, `hover`, `warmup` — plus `lsp_servers` (list the merged registry) and `lsp_registry` (`add`/`remove` an entry, approval-gated) — over any configured stdio language server (gopls, nimtortoise, typescript-language-server, pyright, rust-analyzer, clangd, bash-language-server, jdtls, intelephense, solargraph, csharp-ls by default). The registry is data (`$XDG_CONFIG_HOME/niffler-lsp/servers.json`): adding a language is a config entry or an `lsp_registry add` the agent can make itself — never code (AGENTS.md: language-agnostic core). On-demand tools |
-| `git` | Nim | optional | read-only repo inspection: `git_status`/`git_diff`/`git_log`/`git_show`/`git_blame` over fixed argv (approval-free; mutations stay in bash) plus `review_receipt` — a local diff-fingerprint write/check pair under `var/review-receipts/` for pre-push review handoff (never calls a model; check fails when the diff changed since the receipt). On-demand tools — the worker reaches them via `discover` + `invoke`, keeping the direct toolset small |
+| `git` | Nim | optional | repo inspection: `git_status`/`git_diff`/`git_log`/`git_show`/`git_blame` over fixed argv (approval-free), plus `review_receipt` — a local diff-fingerprint write/check pair under `var/review-receipts/` for pre-push review handoff (never calls a model; check fails when the diff changed since the receipt). With the declared `git.mutations` setting on (the default) it also registers the approval-gated worktree/merge/commit verbs (`git_worktree`, `git_worktree_list`, `git_merge_preview`, `git_merge`, `git_commit`) — see [Worktrees](#worktrees). On-demand tools — the worker reaches them via `discover` + `invoke`, keeping the direct toolset small |
 | `agent` | Nim | optional | subagent sessions, nine tools: `agent_run`/`agent_spawn` (fresh or continued children, background jobs, durable settlement notices) plus `agent_status`/`agent_wait`/`agent_stop`/`agent_steer`/`agent_ask`/`agent_notices`/`agent_list` — see [Fabric and subagents](#fabric-and-subagents) |
 | `expert` | Nim | optional | advisory peer: follows one or more sessions concurrently, LLM-judged, turn-bound steer (see [Expert advisory peer](#expert-advisory-peer-expert)) |
 | `jev` | Nim | optional | advisory discovery over a local decision model (docs/research/JEV-SPIKE.md): `jev_recommend {task, query, kind: "tools"|"skills"}` fetches a fresh shortlist via `core.discover`/`skill_list` and asks the configured System One backend which entry fits; `jev_suggest` takes a caller-supplied 1–24 candidate list, `jev_decide` asks raw typed (`noul`/`choice`/`score`) questions. All three are on-demand, read-effect and **advisory only** — they grant no permission, load no schemas/skills and invoke nothing; a backend outage is a fail-open result and the probability is uncalibrated. Local-only: `NIF_JEV_URL` must be a loopback `/v1/systemone` endpoint (no redirects). The backend (Von) is started by the `von` launcher or by hand — see [Advisory discovery (`jev`) and the Von launcher](#advisory-discovery-jev-and-the-von-launcher). Per-turn **shadow** observations are on by default (`NIF_JEV_SHADOW=0` opts out; `NIF_JEV_SHADOW_KIND`/`_SKILL_QUERY`/`_TOOL_QUERY` tune them) and land in store kind `jevshadow`, never in a conversation; an absent backend writes no record — one warning, then silent cooldowns |
@@ -100,6 +101,7 @@ A one-file index of every shipped capability (not a reference) is
 | `grep` | Nim | optional (4 replicas) | ripgrep-backed search: `grep` (contents, path:line:match, direct, output capped) and `files` (sorted listing, on demand); .gitignore-aware, no shell quoting needed; stateless queue-group replicas overlap same-component searches — parameters, caps, exit codes and the effect classification are in [`grep` in detail](#grep-in-detail) |
 | `systemprompt` | Nim | optional | the conversation constitution: session runners fetch the system prompt from `svc.systemprompt.call` once per conversation (see [System prompt (`systemprompt`)](#system-prompt-systemprompt)) |
 | `compaction` | Nim | optional | default replaceable `compaction_propose` implementation: verifies runner-owned paged snapshots, chooses a permitted cut, and returns a structured checkpoint candidate; the runner alone validates and commits projections — the tool itself is `hidden` + `x-harness.runner: true` (read-effect, 120 s), so no model ever sees it and only a runner or another component calls it; with the component absent or killed, summarization is off and the deterministic rungs (prune, both stub tiers, proportional trim) still run — the ladder degrades, it does not stop |
+| `memory` | Nim | optional | durable fact memory, scoped per repository (see [Long-term memory](#long-term-memory)). Seven on-demand tools: `memory_remember` (one live fact per SUBJECT — re-remembering updates it and keeps the prior text as a revision), `memory_search` (local token-prefix ranking over the scope's records), `memory_get` (one record plus its revision trail), `memory_list`, `memory_forget` (archives a higher revision, never destroys; approval-gated), `memory_recall` (the bounded block) and `memory_scopes` (which scopes resolve here and where they live). Scope is keyed on the repository's PRIMARY root via `sdk/checkout.nim`, so a linked worktree shares its primary's memory rather than starting blank. Facts are appended to conversations through their own `svc.session.<id>.memory` lane — append-only history, never the frozen prefix — at a conversation's first turn and again after a compaction or trim. Every tool degrades to an empty result without a store; absent component means no memory and nothing else changes |
 | `recall` | Nim | optional | on-demand `context_recall` resolver for canonical messages, full spill documents, and the current durable checkpoint — plus `mode: search`, a ranked search over the conversation's whole canonical history (trimmed/compacted-away messages included) through the store's search index, with a substring-grep fallback when the store cannot search; `scope: "all"` widens to every conversation but is refused for session calls (a cross-conversation disclosure — direct bus callers only, issue #51) |
 | `cli` | Nim | — | on-demand bus driver for scripts/CI (`catalog`/`wait`/`call`/`install`) and the headless turn driver (`run` — attach to a home or `--own` one, stream or `--quiet`, optional `--export` transcript) — a pure client that never publishes `reg.publish`, so it never appears in `catalog` and `cli wait cli` can never succeed |
 | `console` | Nim | — | on-demand bus viewer (renders every envelope on stdout) |
@@ -575,12 +577,25 @@ process owns the file (flock; kernel-released on crash), everyone else speaks
 envelopes. `tidb` has no file to lock — the cluster is shared state by
 design, and row locks plus the rev counter arbitrate between harnesses.
 
+On any one bus, core admits at most one `store` PID. Both shipped engines
+request `reg.admit` before subscribing to `svc.store.call`, on first connect and
+on re-attach; a second `store` — a stray test root, another clone, or a recovery
+that landed on the wrong bus — is refused and closes its connection without
+taking any store calls, even when its contract and root match. The existing PID
+may re-announce after recovery, and the flock still protects the SQLite file.
+Admission is a cooperative boundary, not authentication: retire old binaries
+that never request it, and restart core and stores together. It holds
+independently of the engine and of the root — a second data file does not buy
+a second store (see [WIRE.md](WIRE.md) "Subjects").
+
 `list` is a **page**, not a complete view: `limit` defaults to 100 and is
 clamped to 1000, and the reply carries `hasMore` plus a `nextAfter` id cursor.
 Pass `nextAfter` back as `after` to walk the rest — `after` is exclusive, and
 `nextAfter` is absent when `hasMore` is false. The store keeps full histories,
 so a long conversation does not fit in one call; core's own full-kind reads
-(resume, `session_info`, `conversation_delete`) page automatically.
+(resume, `session_info`, `conversation_delete`) page automatically, and fail
+closed on a partial read — `hasMore: true` with no advancing cursor is an
+error, never end-of-data (`storeListAll`, core/dispatch.nim).
 
 The store contract is one test run against every engine: `make test-store`
 (the default engine), `make test-store-tidb`
@@ -662,6 +677,7 @@ see [The `.env` file](#the-env-file)) and inherit core's environment. `NIF_BIN_D
 |---|---|---|
 | `NIF_ROOT` | the harness root (repo). Core derives it from its binary location if unset, and sets it for all children. Components use it to find the SDK, `var/`, `.env`. Every component runs with **cwd = NIF_ROOT**, so the agent's `bash pwd` is always the home — regardless of where you launched the harness | `<binary location>/../..` |
 | `NIF_BASH_SANDBOX_MAP` | `<absolute-dir>=<image>` lines (longest matching prefix of the command's `cwd` wins) that make the `bash` tool run every command — foreground and `run_in_background` alike — as `docker run --rm --network none` with only that workspace root bind-mounted at the same path (the image's toolchains and caches, the workspace, and nothing else). Written by hosted-benchmark lanes (the DeepSWE port); a `cwd` that matches no entry fails the call loudly (exit 125) rather than running unsandboxed. Takes precedence over `NIF_BASH_NET` | unset |
+| `NIF_SANDBOX_STRICT` | `1` makes an operator-env guard (`NIF_BASH_SANDBOX=on`) launch with **strict** reach — the host root is not mounted, so reads reach only the workspace, approved roots and a reviewed runtime set — instead of the default `compat` (writes confined, host readable). A conversation whose own sandbox policy is enabled always asks for strict. A strict launch **refuses** rather than degrading to Landlock (writes-only, reads unconfined); `NIF_SANDBOX_ALLOW_DEGRADED=1` still permits that degradation for a compat launch only. `make doctor` reports which backend a host can actually provide | unset (compat) |
 | `NIF_BASH_SANDBOX` | `on` runs every **foreground** `bash` command through the `niffler-sandbox` launcher (see [Shell guard and read masks](#shell-guard-and-read-masks)): workspace writable at its own path, the rest of the host bind-mounted read-only, private `/tmp`, fresh `/proc`, no network and no bus. `off` (the default) is unguarded. Any other value refuses. The workspace comes from the runner's session context, else `NIF_BASH_SANDBOX_ROOT`; a guarded `run_in_background` call is refused rather than run unguarded, and the guard cannot be combined with `NIF_BASH_SANDBOX_MAP` | `off` |
 | `NIF_BASH_SANDBOX_ROOT` | workspace path for a guarded command that has **no** session context (a bare `cli` call). A conversation turn supplies the workspace itself, so this is only for direct bus calls | unset |
 | `NIF_BASH_SANDBOX_MASKS` | operator-owned exact paths, one per line (absolute, or relative to the workspace), hidden from reads **and** writes: `read`, `grep`/`files`, `repomap` and skill resources refuse them, symlink and hard-link aliases are refused, and the shell guard binds `/dev/null` over each so a guarded command cannot read them either. Active whether or not the shell guard is on. A mask is a mask, not a confidentiality boundary: it removes what would have been returned, and cannot hide the same bytes behind an undeclared path or a copy taken before it was configured. A configured but missing path refuses rather than dropping the protection | unset |
@@ -712,7 +728,7 @@ see [The `.env` file](#the-env-file)) and inherit core's environment. `NIF_BIN_D
 | `NIF_LSP_BIN_DIRS` | extra directories searched for server binaries beyond PATH (colon-separated; a leading `~` means your home directory) | — |
 | `NIF_TRAFILATURA` | Trafilatura executable path/name; `off` disables external extraction | auto-detect `trafilatura` on `PATH` |
 | `NIF_LOG_LEVEL` | SDK structured-log publication threshold (`debug`, `info`, `warn`, `error`). Core's `--log=<level>` flag sets it for core and every component it spawns | `info` |
-| `NIF_RECONNECT_GRACE_S` | seconds a Nim or Go SDK component tolerates an unreachable bus before it **re-attaches**: re-resolve the URL (`NIF_NATS_URL` → `$NIF_ROOT/var/nats-url` → the well-known port, so a core restarted on a new port is found), redial (with exponential backoff in Nim), rebuild every subscription and re-publish `reg.publish`. Deliberately above the NATS client's own reconnect budget (~2 min), so a shorter outage never triggers it; a value that is not a positive number leaves the default. The TypeScript SDK does not re-attach yet | `180` |
+| `NIF_RECONNECT_GRACE_S` | seconds a Nim or Go SDK component tolerates an unreachable bus before it **re-attaches**: re-resolve the URL (`NIF_NATS_URL` → `$NIF_ROOT/var/nats-url`, so a core restarted on a new port is found; components never fall back to a guessed well-known port), validate that the answering core serves this root before subscribing, redial (with exponential backoff in Nim), rebuild every subscription and re-publish `reg.publish`; a refused candidate is retried on the next discovery pass instead of joined. Deliberately above the NATS client's own reconnect budget (~2 min), so a shorter outage never triggers it; a value that is not a positive number leaves the default. The TypeScript SDK does not re-attach yet | `180` |
 | `NIF_NATS_DIAL_TIMEOUT` | seconds allowed for a Go SDK component's initial NATS handshake (and reattach). A relayed bus reached through `ssh … incus exec … cli relay` pays process spawn plus a fresh TCP connect before INFO arrives, which nats.go's 2 s default cannot meet; values 1–600 are honoured, anything else leaves the default | `15` |
 | `NIF_LLM_MAX_RETRIES` | additional attempts for transient LLM failures (429/5xx/overloaded/connection drop) with exponential backoff; each retry announces `ev.session.<id>.retry`. Auth/quota/bad-request errors always fail fast | `2` |
 | `NIF_LLM_MAX_STREAM_RETRIES` | additional attempts when a streamed response drops mid-flight — budgeted separately from the general case because a dropped stream may already have billed output | `2` |
@@ -772,6 +788,7 @@ see [The `.env` file](#the-env-file)) and inherit core's environment. `NIF_BIN_D
 | `NIF_OAUTH_CALLBACK_HOST` | host for the local OAuth callback listener (ports stay fixed at 1455/53692) | `127.0.0.1` |
 | `NIF_LOG_MAX_MB` | core's child-log retention cap in `var/logs` (MB) | `200` |
 | `NIF_LOG_RETENTION_DAYS` | days core retains child logs before sweeping | `7` |
+| `NIF_LOG_ROTATE_MB` | per-file rotation threshold for `var/logs`, checked at boot and hourly; oversized files rotate to `<name>.log.1` (one generation kept), so this is not a hard instantaneous cap | `5` |
 | `NIF_SPAWN_WAIT_MS` | how long `core.spawn` waits for the new component to register in the catalog before failing the call (clamped 250–120000); the wait ends early when the catalog records a refusal, so the knob only bounds a silent component | `5000` |
 
 **Build and script knobs** — read by the scripts around the harness, never by
@@ -838,6 +855,9 @@ families: `ev.log.<component>` from the SDKs, `ev.lsp.warm`, `ev.agent.*`,
 `ev.fabric.*`):
 
 ```
+reg.admit              optional pre-subscription admission request (raw registration
+                       JSON); core replies {ok, name, pid, reason} — a refused store
+                       never subscribes to its call subject
 reg.publish            component announces itself: {name, version, pid, tools:[{name, schema}]}
 reg.depart             graceful shutdown announcement
 svc.<component>.call   queue-grouped tool call request/reply
@@ -1214,6 +1234,118 @@ rather than waiting: turns never nest, and a client that waits instead just
 expires its own timeout (this is what made `/export` look broken during a long
 turn).
 
+## Long-term memory
+
+A conversation forgets everything when its runner exits. The store keeps the
+transcript, but nothing turns "we learned on Tuesday that `make build` needs
+`-j1` on this box" into something the *next* conversation in this repo already
+knows. The optional `memory` component is that layer; the design and its
+reasoning are in [research/MEMORY.md](research/MEMORY.md).
+
+### Scope: per repository, shared by its worktrees
+
+The scope key is the **primary checkout's** path, resolved through
+`sdk/checkout.nim` — the same classification the write fence uses. That is the
+one decision worth understanding:
+
+| Scope | Key | Read by |
+|---|---|---|
+| `repo` (default) | `<primaryRoot>` of the checkout | every conversation in that repository, **including every `git worktree` of it** |
+| `dir` | the workspace path | conversations in that non-git directory |
+| `global` | `"global"` | any conversation, read **last** |
+| `conversation` | the conversation id | that conversation only |
+
+A worktree is a different path but the same repository, so keying on the
+workspace path would give each `/worktree add` an amnesiac clone of the repo it
+was cut from — backwards, since a worktree is where you go to *apply* what the
+repository already taught you. `memory_scopes` reports the resolved key, which
+is how you confirm the sharing is in effect.
+
+**Strictest scope wins**: a `repo` fact shadows a `global` fact with the same
+subject. Reading *another* repository's memory is refused, not filtered.
+
+### One live fact per subject
+
+`memory_remember` writes a record keyed by a dotted **subject**
+(`build.jobs`, `deps.package_manager`). Remembering the same subject again
+**updates** it — revision 2 — and the prior text is kept as a `memory-rev`
+document. So "we use npm" and "we use pnpm" cannot coexist and leave the model
+holding both, and a correction stays debuggable afterwards. `memory_forget`
+archives a higher revision instead of destroying the record.
+
+`volatility` (`stable`/`slow`/`fast`) plus `verifiedAt` make staleness a
+**ranking** signal, never a delete: an expired fact comes back marked
+`stale: true` with its age, so the model re-verifies rather than trusting or
+losing it.
+
+### How memory reaches the model
+
+Two mechanisms, each on a different seam:
+
+- **Teaching** — one static line into the frozen prompt (`prompt_hint`),
+  registered once. It never changes, so it is legal under the prefix
+  invariant.
+- **Recall** — a bounded block appended to history, capped by
+  `recallFacts`/`recallChars`. It rides its own `svc.session.<id>.memory` lane
+  (the same shape the repo map and LSP diagnostics use), so it is **append-only
+  history, never a prefix edit**. It is published at a conversation's first
+  turn and again after a compaction or trim — the moment the historical facts
+  it summarized away are worth restoring — and not on every turn, because a
+  fixed per-turn tax buys a benefit concentrated at two moments.
+
+`memory.autoRecall` (`birth` | `compaction` | `both` | `off`) and the two
+budgets are a declared config domain (`config_patch memory`).
+
+### Write policy
+
+| Op | Gate |
+|---|---|
+| new subject, no secret-shaped text | none — a memory that prompts on every write is one the model stops using |
+| `memory_forget` | `x-harness.approval: "always"` |
+| writing `scope: "global"` | `x-harness.approval: "always"` (blast radius is every repo) |
+| credential-shaped text (`sk-…`, `ghp_…`, `AKIA…`, `-----BEGIN`, a key-ish word beside a long secret-alphabet run) | refused with `code: "secret"` — memory is durable store state recalled into every conversation in the scope, so it must not hold secrets; record *where* the secret lives instead |
+
+Subagents fail closed: a session with `sessionmeta.parent` may not write.
+
+### Retrieval, honestly labelled
+
+Set `memory.embedProvider` to an embedding-capable provider nickname to enable
+semantic `memory_search` and query-focused `memory_recall`. Empty (the default)
+uses text ranking. An embedding failure falls back to text; search reports the
+ranker and a warning. Automatic birth/post-compaction recall still supplies
+bounded standing facts, not a semantic query against the latest turn.
+
+Semantic retrieval lazily derives revision-tagged embedding documents from
+curated facts, uses `search_document:` / `search_query:` prefixes, and validates
+hits against the current source revision so forgotten or corrected text cannot
+be recalled from an old vector. SQLite applies instance and arbitrary literal
+`idPrefix` filters before its exact cosine-distance top-k. This is an exact scan
+of filtered candidates, not an approximate index-speed claim. TiDB vector
+retrieval remains unsupported.
+
+For local nomic without Ollama:
+
+```bash
+make install-embed    # optional llama.cpp CPU runner + Q4 GGUF (~107 MB)
+make embed-up        # persisted supervised local-embed launcher; live harness
+```
+
+Register a keyless loopback provider with `baseUrl` set to
+`http://127.0.0.1:18100/v1` and `embedModel: "local-nomic-q4"`, then set
+`memory.embedProvider` to that nickname through config. `make embed-down` removes
+the launcher record. Installation does not start a service or change providers.
+The foreground equivalent is `bash scripts/embed-server.sh`; the runtime binds
+loopback and uses a 2048-token context/batch. Do not infer an 8192-token window
+from the original model card. A Linux CPU smoke run with llama.cpp b12345 and
+nomic Q4 returned 768-dimensional vectors and ranked a dependency query closer
+to the package-manager fact than to unrelated text. This is a smoke check, not
+a retrieval-quality benchmark or macOS certification; the deterministic fixture
+validates plumbing, not nomic accuracy.
+
+Memory searches *memory*. For what was said earlier in a conversation —
+including text a trim removed — use
+[`context_recall`](#context-window) instead.
+
 ## Shell guard and read masks
 
 Three different things in this harness are called isolation. They do not borrow
@@ -1226,6 +1358,13 @@ each other's authority, and the manual keeps them apart deliberately:
 | **machine isolation** | shipped, for fleet | an Incus container or Lima VM per remote instance — a separate kernel and userland, which is why trusted-worker delegation is meaningful |
 
 ### The shell guard (off by default)
+
+`make setup` installs `bubblewrap` on Linux (never on macOS — it is a Linux
+namespace tool, and the macOS answer is Seatbelt, which is not implemented).
+`make doctor` probes the backend with a forbidden operation and reports
+`bwrap` / `landlock` / `UNAVAILABLE`, so "the sandbox is available" is never
+assumed from the binary merely existing; on Ubuntu 23.10+ it also points at
+`make install-sandbox-profile` when AppArmor is blocking user namespaces.
 
 With `NIF_BASH_SANDBOX=on`, every foreground `bash` command is exec'd through the
 launcher (`var/bin/niffler-sandbox`, built by `make build`) instead of directly.
@@ -1393,7 +1532,7 @@ separate replaceable component — [COMPACTION.md](COMPACTION.md)):
   mode, budgets and provider pins are separate controls, and a granted root is
   not an isolation boundary.
 
-- `session {sessionId, content?, provider?, model?, thinking?, title?, cwd?, profile?, discovery?, tools?, maxRounds?, maxCalls?, maxTokens?, roots?, stop?}` accepts a
+- `session {sessionId, content?, provider?, model?, thinking?, title?, cwd?, profile?, discovery?, tools?, maxRounds?, maxCalls?, maxTokens?, roots?, stop?, invoke?}` accepts a
   conversation-scoped provider and model override. `provider` names a stored
   provider nickname (empty clears it back to the harness-global default); a
   model-only call resolves and pins the provider it belongs to in the same
@@ -1448,11 +1587,13 @@ separate replaceable component — [COMPACTION.md](COMPACTION.md)):
   `/workspace` repin — and the header records that decision (`cwdPinned`); a
   control call (a status readback, a model pin) that merely creates the header
   does not write one. A workspace that was never chosen — the header still
-  names the harness-root default — stays repinnable even after turns have run,
-  which is the way out of a conversation anchored at the wrong tree by that
-  fallback. Once a workspace IS chosen it is immutable after the first turn,
-  because a resume must resolve context and paths exactly as the original turn
-  did. While the conversation is still pristine (no turn anywhere — asked of
+  names the harness-root default and carries no pin — stays repinnable even
+  after turns have run, which is the way out of a conversation anchored at the
+  wrong tree by that fallback. An explicit request for the path already in
+  force is still a choice: it persists the pin, so the default becomes chosen
+  like any other workspace. Once a workspace IS chosen it is immutable after
+  the first turn, because a resume must resolve context and paths exactly as
+  the original turn did. While the conversation is still pristine (no turn anywhere — asked of
   the store, not of the runner's memory) an explicit `cwd` also re-resolves the
   constitution: nothing has reached a provider, so there is no cached prompt
   prefix to invalidate. An empty `cwd` is not a choice — it is refused rather
@@ -2603,12 +2744,13 @@ own opaque `bash` claim (so every primary `bash` would serialize against every
 worktree write), and it dirties `git status` unless an ignore rule is added — a
 sibling needs neither. The layout is not configurable.
 
-Enable the mutation verbs with the declared setting `git.mutations` (or
-`NIF_GIT_MUTATIONS=1`); without it only the read tools register:
+The mutation verbs register when the declared setting `git.mutations` (or
+`NIF_GIT_MUTATIONS`) is on; it defaults to on, and turning it off leaves only
+the read tools:
 
 | Tool | Approval | What it does |
 |---|---|---|
-| `git_worktree_list {repo?}` | none (read) | every worktree: path, branch, HEAD, lock (and reason), prunable, whether it is the tree you are calling from, and — from the ownership ledger — which conversation created it |
+| `git_worktree_list {repo?, status?}` | none (read) | every worktree: path, branch, HEAD, lock (and reason), prunable, whether it is the tree you are calling from, and — from the ownership ledger — which conversation created it. `status: true` adds each tree's `clean`/`changed`/`untracked` and its `ahead`/`behind` against the primary's current branch (named once as `compare`, with `comparedAgainst` explaining an empty compare), at two extra git calls per tree |
 | `git_worktree {op, repo?, name?, path?, branch?, base?, force?, delete_branch?}` | always | `add` cuts `<repo>.wt/<name>` from `base` (default: the primary's current branch), locks it and records the owner; `remove` retires a tree; `prune` clears records for trees deleted by hand |
 | `git_merge_preview {repo?, into?, from_ref?}` | none (read) | what merging would do, computed by `git merge-tree` without touching a working tree: clean (with `ahead`/`behind` and a stat), or the conflicting paths |
 | `git_merge {op, repo, into?, from_ref?, strategy?, allow_dirty?}` | always | `start` merges into the checked-out branch; `abort` unwinds a conflicted merge |
@@ -2635,8 +2777,12 @@ thinks you meant, so the next call is unambiguous.
 A conversation's *workspace set* is its primary plus the trees that belong to the
 same project; the write fence admits the whole set, so by default a conversation
 in a worktree can also write the primary. `isolation: "worktree"` narrows the
-**claim** set to the conversation's own tree, so a write to the primary is
-refused with the existing `[E_WRITE_OUTSIDE]`.
+**claim** set to the conversation's own tree plus any explicit `/roots` grants,
+so a write to a discovered tree such as the primary is refused with the existing
+`[E_WRITE_OUTSIDE]`. Grants survive isolation because the two kinds of root are
+different facts: discovery is automatic, while a grant was a human's deliberate
+decision in this conversation (`claimRootsFor` orders the conversation's own
+tree first).
 
 - **Human-only.** It is not in the `session` tool's schema, exactly like `roots`,
   so the model cannot widen or narrow its own scope.
@@ -2648,6 +2794,13 @@ refused with the existing `[E_WRITE_OUTSIDE]`.
   would make the tree a cage.
 - **It is a fence, not a mutex.** Two conversations in one tree still proceed on
   different files — `locks` keeps its path striping.
+- **Two lifecycle calls get a per-call primary claim.** `git_merge` and
+  `git_worktree {op: "remove"}` declare `writes: {"primary": true}`: when the
+  call's `repo` resolves to exactly the conversation's linked primary checkout,
+  core leases that root for this call only. It changes no root grant, no
+  `isolation` state and no bash/edit fence, and approval plus lock contention
+  still apply. Other repositories, sibling trees and primary subdirectories are
+  still refused (WIRE.md "x-harness schema extensions").
 - Persisted in the header, restored on resume, mutable between calls, and
   reported as `isolation` on the session status readback and in
   `session_info.workspace`.
@@ -2674,16 +2827,21 @@ authority, the client is a shortcut.
 ### Provenance (`origin`) and merge notices
 
 A conversation seeded from another's history records `sessionmeta.origin =
-{session, atSeq, reason, worktree?}`. It is **provenance, never authority**: it
+{session, atSeq, reason, worktree?}`. It is **provenance, not supervision**: it
 grants no continuation rights, no approval routing, no depth exemption and no
-idle retirement. A *supervised* fork (`agent_spawn {fork}`) carries both edges —
-`parent` for supervision and `origin` for provenance; a **peer** fork
-(`agent_fork`, a hidden client tool) carries only `origin`, because nothing is
-supervising it.
+idle retirement. The one exception is tree retirement — a peer fork may remove
+the exact tree its recorded `origin` created for it, verified from the store
+rather than from a tool argument; unrelated conversations, sibling trees, dirty
+trees and unmerged work are still refused. A *supervised* fork
+(`agent_spawn {fork}`) carries both edges — `parent` for supervision and
+`origin` for provenance; a **peer** fork (`agent_fork`, a hidden client tool)
+carries only `origin`, because nothing is supervising it. New peer forks
+receive a normal `conv-…` session id (`agent-…` stays the supervised-subagent
+prefix), and existing ids are not renamed.
 
-`session_info` reports `origin` forward and `descendants` backward
-(`{sessionId, supervised, origin?}`), so "what came of this exploration?" is one
-call from where it started.
+`session_info` reports `origin` forward and a deduplicated `descendants` list
+backward (`{sessionId, supervised, origin?, fork?, closed?}`), so "what came of
+this exploration?" is one call from where it started.
 
 After a successful merge, the merging conversation's origin receives a durable
 `worktreemerge` record (source, worktree, branch, commit, files, target branch).
@@ -2702,14 +2860,29 @@ between them leaves a successful merge whose origin is never told. The next
 `/worktree [add NAME [--fork]|merge|rm PATH|close]`, plus `· isolated` in the
 bottom row and the isolation line in `/workspace`.
 
+A bare `/worktree` is the status view, and it answers the question a human opens
+it for rather than dumping the tool's JSON: the conversation's workspace (and
+whether it is the primary or a linked tree), the primary, the isolation scope,
+the origin of a fork, the roots granted on top of the workspace, and one row per
+tree with `*` marking this conversation's. Each row carries the dirt and the
+divergence the next decision needs — `clean` or `dirty (2 changed, 1 untracked)`,
+`3 ahead of main`, `prunable (directory gone — rm or prune)`, the owning
+conversation — so `close`/`rm`/`merge` can be chosen without opening another
+command. It asks git for `status: true`, which is why the view is a report and
+the tool's default listing stays cheap.
+
 `add` creates the tree and then picks an outcome, saying which: **move** when the
 conversation is pristine or its workspace was never chosen and the tree is clean;
 **fork** when a workspace was already chosen (the exploration stays its own
 record, and the new conversation has *read* it); **refuse** when the old tree is
 dirty, offering `--fork` to leave those edits where they are. `close` removes the
 tree and switches back to the origin. Client-side git work goes through the
-session-scoped `invoke` control rather than a direct component call, so approvals
-and session attribution behave exactly as they do for the model.
+session-scoped `invoke` control (`session {invoke: {tool, arguments}}`) rather
+than a direct component call, so approvals, write fences and session attribution
+behave exactly as they do for the model. It is human-only — not in the model's
+session schema, refused in an unattended task session, and hidden tools stay
+unreachable through it — and it runs no LLM turn (WIRE.md "Client tool
+controls").
 
 ## Background processes (`processes`)
 
@@ -2729,7 +2902,7 @@ different contract: start once, poll incremental output, kill explicitly.
 | `process_start {command, label?, workdir?}` | Spawn the command detached (own process group, stdin from /dev/null, stdout/stderr appended to spool files under `var/processes/`) and return its id immediately. Approval-gated. A background start through the `bash` tool's `run_in_background` is approved once, on the `bash` call itself — the internal `process_start` goes straight over NATS and never passes core's approval gate, while a direct `process_start` issued through core (the model, or any tool reached via `svc.core.call`) is gated — a bus client that addresses `svc.processes.call` itself (the `cli`, a script) is not gated at all |
 | `process_poll {id, waitMs?, filter?, tail?}` | Drain output appended since the last poll — incremental, never re-injects old bytes; `waitMs` blocks until new output or exit (25 s cap); `filter` is a regex over the new lines (the drain cursor still advances past all of them); any non-empty `tail` re-reads the last ~64 KB of raw output. Use it for output, not to discover completion — that is pushed. Read-effect |
 | `process_kill {id}` | Terminate the whole process group — SIGTERM, 300 ms grace, then SIGKILL. Approval-gated |
-| `process_list {}` | Show the registry — running and recently finished entries with exit codes. Read-effect |
+| `process_list {}` | Show the registry — running and recently finished entries with exit codes, plus each entry's owning `session` and whether it will `notifies` that conversation on exit. Read-effect |
 
 Details:
 
@@ -2741,6 +2914,16 @@ Details:
   `tail: "1"` re-reads recent raw output without advancing cursors. An empty
   nonwaiting poll of a still-running process gives one waiting hint per
   process. Drain semantics are unchanged.
+- **Will it wake me?** A completion is pushed to the owning conversation and,
+  when that conversation is idle, admitted as a bounded wake turn. Two
+  readbacks say whether that will happen, so a human can decide to walk away:
+  `catalog {op: list}` reports `maxWakes` (0 = wakes disabled) and the session
+  status readback reports `wake: {max, used}` — the trailing wake turns since
+  the human's last message. `niffler-tui` renders both next to its background
+  badge (`bg 2 · wake 1/3`, or `completion waits for your next message` once
+  the budget is spent) and marks each `/processes` row with its owner. A wake
+  is best effort, not a guarantee: the durable notice survives a declined or
+  failed wake and is delivered on the next real turn.
 - The child writes append-mode to spool files (never a pipe it could
   deadlock on); the component reads from per-stream cursors, so the OS
   absorbs output bursts. A spool beyond the cap (32 MiB,
@@ -4550,6 +4733,14 @@ artefacts of the approval gate are the client-written grant record (store
 kind `approval`) and the program source core writes to
 `var/approval-sources/<digest>.nim` — no request/verdict history exists.
 
+Core's own `var/logs/core.log` does carry one bounded identity line per
+registration, admission and departure — including refused arrivals — with UTC
+timestamp, subject, PID, announced root (empty for legacy peers), version, name
+and client flag. Fields are truncated and JSON-quoted, so an announced path or
+name cannot forge a line. That is evidence of announced identity, not process
+liveness or database integrity, and it is not an audit log: no prompt prefix or
+conversation history changes, and no bus traffic is captured.
+
 ### `observe`: bounded live inspection
 
 `observe` has one raw `>` subscription. It preserves the original JSON node,
@@ -4724,10 +4915,16 @@ no `reg.depart` was sent, and the catalog kept advertising tools nothing could
 reach, so recovery meant killing the process. The Nim and Go SDKs now watch
 connection health (a `Flush` probe every 2 s) and, once the connection has been
 unhealthy for `NIF_RECONNECT_GRACE_S` (default 180 s, deliberately above the
-client's own patience), **re-attach**: re-resolve the bus URL, redial (with
-exponential backoff in Nim; Go retries on its health tick), rebuild every
-subscription (call, event and tap) and re-publish `reg.publish` — no process
-restart.
+client's own patience), **re-attach**: re-resolve the bus URL (`NIF_NATS_URL`,
+then this root's `var/nats-url` — never a well-known-port guess), validate
+every candidate against the core's advertised root before any subscription
+exists (the same rule as the first connection), redial (with exponential
+backoff in Nim; Go keeps retrying discovery on its health tick when a
+candidate is refused), rebuild every subscription (call, event and tap) and
+re-publish `reg.publish` — no process restart. A refused candidate is skipped
+and retried, never subscribed; a component whose bus is gone fails explicitly
+as "nowhere to go" instead of migrating onto whatever harness answers the
+well-known port.
 
 A component that deferred its announce (the Go SDK's `DeferAnnounce`, e.g.
 `mcp-bridge`) must re-publish its own contract on the fresh connection, since
@@ -5257,10 +5454,12 @@ only a subset — this table is the complete list):
 Backend is the selected engine — SQLite at `var/store.db` by default,
 or the
 DSN-shared TiDB engine (`NIF_STORE_TIDB_DSN`, no flock — row locks and the
-rev counter arbitrate between harnesses). **Exactly one process owns that
-file** — never run two file-backed `store` processes against the same
+rev counter arbitrate between harnesses). **Exactly one `store` process serves
+a harness** — never run two file-backed `store` processes against the same
 database (a second core booted against the same root would do exactly that;
-use a temp `NIF_ROOT` copy for experiments).
+use a temp `NIF_ROOT` copy for experiments). Core refuses bus admission to a
+second `store` PID before it subscribes, including one from another root; this
+is cooperative, so upgrade and restart core and stores together.
 
 `list` is a page, not a complete view (see [Store engines](#store-engines)):
 everything in core that must see a whole kind goes through `storeListAll` —

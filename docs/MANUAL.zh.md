@@ -56,7 +56,7 @@
 | `manifest.yaml` | 引导清单：core 生成哪些组件、重启策略，以及可选的无状态 `replicas` 数量；`--minimal` 将其过滤为 `store`、`bash` 和 `llm` |
 | `var/` | **运行时状态与构建产物，已 gitignore** —— 包含持久存储和基准数据，不可整体删除 |
 | `var/bin/` | 构建出的二进制文件（系统核心 + 会话运行器 + 组件），以及 `builder.build` 编译的一切 —— agent 构建的组件也落在这里，与系统组件并列。由 `make build` 重建 |
-| `var/store.db` | 存储的数据文件（SQLite 是唯一基于文件的引擎）—— **单写入者**：恰好一个 `store` 进程可以打开它，并锁定 `var/store.db.lock`（flock，进程崩溃时由内核释放）。0.4.0 之前的 `var/barrel-db` 会在启动时被拒绝，绝不会被覆盖 |
+| `var/store.db` | 存储的数据文件（SQLite 是唯一基于文件的引擎）—— **单写入者**：恰好一个 `store` 进程可以打开它，并锁定 `var/store.db.lock`（flock，进程崩溃时由内核释放）。Core 还会在该 store 订阅之前拒绝第二个 `store` PID 的总线准入（协作式，因此请一起升级并重启 core 与 store；从不请求准入的旧二进制无法被隔离）。0.4.0 之前的 `var/barrel-db` 会在启动时被拒绝，绝不会被覆盖 |
 | `var/nats-url` | 最后生成的总线的总线地址；UI 桥读取它以找到 core |
 | `var/nats-monitor-url` | 当 core 生成总线时的 HTTP 监控端点；对于复用/远程总线则不存在 |
 | `var/logs/`、`var/captures/` | 轮转的结构化日志和显式的 observe 探针导出（见[观察与日志](#observation-and-logs)） |
@@ -231,6 +231,8 @@ stdin/stdout tty（`make run`）是**管理 shell**，不是会话 UI：它只�
 
 基于文件的引擎（`sqlite`）以相同方式强制单写入者：一个进程拥有该文件（flock；进程崩溃时由内核释放），其他所有进程只讲 envelope。`tidb` 没有可锁的文件——集群按设计就是共享状态，行锁加上 rev 计数器在多个 harness 之间仲裁。
 
+无论使用哪个引擎，core 每条总线只接纳一个 `store` 进程：两个引擎都会在订阅前请求准入，第二个 store PID 会被拒绝并断开连接——即使它来自另一个 root 并拥有自己的数据文件（见 [WIRE.md](WIRE.md) “Subjects”）。
+
 `list` 是一个**页**，不是完整视图：`limit` 默认为 100，并被钳制到 1000，回复携带 `hasMore` 以及 `nextAfter` id 游标。将 `nextAfter` 作为 `after` 传回以遍历其余部分——`after` 是排他的，当 `hasMore` 为 false 时 `nextAfter` 不存在。存储保留完整历史，因此一段长对话无法在一次调用中装下；core 自身的全 kind 读取（resume、`session_info`、`conversation_delete`）会自动分页。
 
 存储契约是对每个引擎运行同一套测试：`make test-store`（默认引擎）、`make test-store-tidb`（需要 `NIF_STORE_TIDB_DSN`，否则打印 SKIP）；`t_store_paging` 固定了 resume 和迁移所依赖的 `after`/`hasMore`/`nextAfter` 游标语义。
@@ -328,7 +330,7 @@ Niffler 没有单一配置文件。环境用于启动决策，存储文档和会
 | `NIF_LSP_BIN_DIRS` | 在 PATH 之外搜索服务器二进制的额外目录（冒号分隔；前导 `~` 表示你的 home 目录） | — |
 | `NIF_TRAFILATURA` | Trafilatura 可执行文件路径/名称；`off` 禁用外部提取 | 在 `PATH` 上自动检测 `trafilatura` |
 | `NIF_LOG_LEVEL` | SDK 结构化日志发布阈值（`debug`、`info`、`warn`、`error`） | `info` |
-| `NIF_RECONNECT_GRACE_S` | Nim 或 Go SDK 组件在总线不可达时容忍的秒数，超过后**重新接入**：重新解析 URL（`NIF_NATS_URL` → `$NIF_ROOT/var/nats-url` → 众所周知的端口，因此在新端口上重启的 core 也能被找到）、重拨（Nim 采用指数退避）、重建每个订阅并重新发布 `reg.publish`。刻意高于 NATS 客户端自身的重连预算（约 2 分钟），因此更短的中断绝不触发它；不是正数的值会保留默认值。TypeScript SDK 目前尚不重新接入 | `180` |
+| `NIF_RECONNECT_GRACE_S` | Nim 或 Go SDK 组件在总线不可达时容忍的秒数，超过后**重新接入**：重新解析 URL（`NIF_NATS_URL` → `$NIF_ROOT/var/nats-url`——绝不猜测众所周知的端口）、在订阅前验证应答的 core 服务此 root、重拨（Nim 采用指数退避）、重建每个订阅并重新发布 `reg.publish`；被拒绝的候选会在下一轮发现中重试，而不会被加入。刻意高于 NATS 客户端自身的重连预算（约 2 分钟），因此更短的中断绝不触发它；不是正数的值会保留默认值。TypeScript SDK 目前尚不重新接入 | `180` |
 | `NIF_NATS_DIAL_TIMEOUT` | Go SDK 组件首次 NATS 握手（以及重新接入）允许的秒数。通过 `ssh … incus exec … cli relay` 到达的中继总线在 INFO 到达前要付出进程启动加全新 TCP 连接的开销，nats.go 默认的 2 秒无法满足；1–600 的值会被采用，其他值保留默认值 | `15` |
 | `NIF_LLM_MAX_RETRIES` | 对瞬时 LLM 失败（429/5xx/过载/连接断开）的额外尝试次数，带指数退避；每次重试宣告 `ev.session.<id>.retry`。认证/配额/错误请求错误始终快速失败 | `2` |
 | `NIF_LLM_MAX_STREAM_RETRIES` | 流式响应中途断开时的额外尝试次数——与一般情况分开预算，因为断开的流可能已经计费了输出 | `2` |
@@ -386,6 +388,7 @@ Niffler 没有单一配置文件。环境用于启动决策，存储文档和会
 | `NIF_WRITE_MAX_BYTES` | `write` 工具整文件负载的上限 | `900000` |
 | `NIF_OAUTH_CALLBACK_HOST` | 本地 OAuth 回调监听器的主机（端口固定为 1455/53692） | `127.0.0.1` |
 | `NIF_LOG_MAX_MB` | core 在 `var/logs` 中子进程日志保留上限（MB） | `200` |
+| `NIF_LOG_ROTATE_MB` | `var/logs` 单文件轮转阈值，启动时及每小时检查；超限文件轮转为 `<name>.log.1`（保留一代），并非即时硬上限 | `5` |
 | `NIF_LOG_RETENTION_DAYS` | core 在清扫前保留子进程日志的天数 | `7` |
 | `NIF_SPAWN_WAIT_MS` | `core.spawn` 在新组件于目录中注册之前等待多久才使调用失败（钳制 250–120000）；当目录记录拒绝时等待提前结束，因此该旋钮仅约束静默组件 | `5000` |
 
@@ -1206,12 +1209,12 @@ git worktree 是同一仓库的第二个检出。Niffler 把它当作一等公�
 写入串行化），并且除非添加忽略规则，它会弄脏 `git status` —— 同级目录两者都不需要。
 该布局不可配置。
 
-用已声明的设置 `git.mutations`（或 `NIF_GIT_MUTATIONS=1`）启用变更动词；
-没有它时只注册读取工具：
+变更动词在已声明的设置 `git.mutations`（或 `NIF_GIT_MUTATIONS`）开启时注册；
+该设置默认开启，关闭后只注册读取工具：
 
 | 工具 | 审批 | 作用 |
 |---|---|---|
-| `git_worktree_list {repo?}` | 无（读取） | 每个工作树：路径、分支、HEAD、锁（及原因）、是否可清理、是否为调用来源树，以及（来自归属账本）哪个会话创建了它 |
+| `git_worktree_list {repo?, status?}` | 无（读取） | 每个工作树：路径、分支、HEAD、锁（及原因）、是否可清理、是否为调用来源树，以及归属账本中的创建会话。`status: true` 额外报告每棵树的 `clean`/`changed`/`untracked` 和相对 primary 当前分支的 `ahead`/`behind`（`compare`）；每棵树多运行两次 git |
 | `git_worktree {op, repo?, name?, path?, branch?, base?, force?, delete_branch?}` | 总是 | `add` 从 `base`（默认 primary 当前分支）切出 `<repo>.wt/<name>`，加锁并记录归属；`remove` 回收工作树；`prune` 清理已手工删除的工作树记录 |
 | `git_merge_preview {repo?, into?, from_ref?}` | 无（读取） | 用 `git merge-tree` 计算合并结果而不触碰工作树：干净（含 `ahead`/`behind` 与 stat）或冲突路径 |
 | `git_merge {op, repo, into?, from_ref?, strategy?, allow_dirty?}` | 总是 | `start` 合并到当前检出的分支；`abort` 撤销冲突中的合并 |
@@ -1233,7 +1236,9 @@ git worktree 是同一仓库的第二个检出。Niffler 把它当作一等公�
 
 会话的*工作区集合*是它的 primary 加上属于同一项目的各工作树；写围栏放行整个集合，
 所以默认情况下工作树中的会话也能写 primary。`isolation: "worktree"` 把**声明**集合
-收窄为会话自己的工作树，因此对 primary 的写入会以既有的 `[E_WRITE_OUTSIDE]` 拒绝。
+收窄为会话自己的工作树加上任何显式的 `/roots` 授权，因此对 primary 之类的自动发现树的
+写入会以既有的 `[E_WRITE_OUTSIDE]` 拒绝。授权在隔离下保留，因为这两类根是不同的事实：
+发现是自动的，而授权是本会话中人类的明确决定（`claimRootsFor` 把会话自己的树放在首位）。
 
 - **仅限人类。** 与 `roots` 一样不在 `session` 工具 schema 中，所以模型无法自己放宽或收窄范围。
 - **没有可隔离对象时拒绝。** 工作区是普通检出或子模块的会话会被拒绝并说明原因，
@@ -1242,6 +1247,11 @@ git worktree 是同一仓库的第二个检出。Niffler 把它当作一等公�
   拒绝它们会把工作树变成牢笼。
 - **它是围栏，不是互斥锁。** 同一棵树中的两个会话仍可在不同文件上并行 ——
   `locks` 保持路径分条。
+- **两个生命周期调用获得一次性 primary 声明。** `git_merge` 与
+  `git_worktree {op: "remove"}` 声明 `writes: {"primary": true}`：只有当调用的
+  `repo` 恰好解析为会话所链接的 primary 检出时，core 才为本次调用租用该根。
+  它不改变任何 root 授权、`isolation` 状态或 bash/edit 围栏，审批与锁竞争仍然适用。
+  其他仓库、同级树与 primary 子目录仍会被拒绝（WIRE.md「x-harness schema extensions」）。
 
 持久化在 header 中，恢复时还原，调用之间可变，并在会话状态回读和
 `session_info.workspace` 中报告为 `isolation`。
@@ -1264,13 +1274,17 @@ git worktree 是同一仓库的第二个检出。Niffler 把它当作一等公�
 ### 溯源（`origin`）与合并通知
 
 由另一会话历史播种的会话会记录 `sessionmeta.origin = {session, atSeq, reason, worktree?}`。
-它**只是溯源，绝非权限**：不授予继续权、不路由审批、不豁免深度、不做空闲退休。
+它**只是溯源，不是监督**：不授予继续权、不路由审批、不豁免深度、不做空闲退休。
+唯一的例外是工作树退休 —— 对等分叉可以移除其记录的 `origin` 为它创建的那棵确切工作树，
+依据存储而非工具参数校验；无关会话、同级树、脏树与未合并的工作仍会被拒绝。
 *受监督*的分叉（`agent_spawn {fork}`）同时携带两条边 —— 监督用 `parent`、溯源用
 `origin`；**对等**分叉（`agent_fork`，隐藏的客户端工具）只携带 `origin`，
-因为没有任何东西在监督它。
+因为没有任何东西在监督它。新的对等分叉使用普通的 `conv-…` 会话 id
+（`agent-…` 仍是受监督子代理的前缀），既有 id 不会被重命名。
 
-`session_info` 向前报告 `origin`，向后报告 `descendants`（`{sessionId, supervised, origin?}`），
-所以"这次探索产生了什么？"从起点出发只需一次调用。
+`session_info` 向前报告 `origin`，向后报告去重后的 `descendants` 列表
+（`{sessionId, supervised, origin?, fork?, closed?}`），所以"这次探索产生了什么？"
+从起点出发只需一次调用。
 
 成功合并后，发起合并会话的 origin 会收到持久的 `worktreemerge` 记录（来源、工作树、
 分支、commit、文件、目标分支）。它在父会话的下一个回合作为机制消息投递 —— 父会话空闲时
@@ -2551,7 +2565,7 @@ await comp.requestEnvelope(subject, envelope, timeoutMs?)
 每个 SDK 都让 NATS 执行主题匹配，并且只分派绑定到投递该消息的订阅的处理程序。这避免了以前的叉积问题，即一次调用可能通过 call、event 和 tap 路径多次投递。Nim 保持无回调和无线程；Go 使用其现有的互斥锁，TypeScript 使用其 promise 链。关闭时，Go 先排空订阅（至其有界关闭宽限期），然后停止每个组件的投递循环并等待所有正在运行的处理器完成，以保留欠给调用方的回复——已接受但尚未启动的调用会被拒绝，而不是静默丢弃；TypeScript 等待排队的处理程序，而不会死锁显式关闭自身组件的处理程序。
 
 #### Re-attaching after a bus outage
-NATS 客户端会透明地重连到同一 URL，但总线在超出其重连预算后仍不可达——或 harness 在新端口上重启——过去会让组件**存活却失聪**：订阅不再投递，没有发出 `reg.depart`，目录仍宣告着无人能到达的工具，恢复只能靠杀死进程。Nim 和 Go SDK 现在监视连接健康（每 2 秒一次 `Flush` 探测），一旦连接不健康持续 `NIF_RECONNECT_GRACE_S`（默认 180 秒，刻意高于客户端自身的耐心），就**重新接入**：重新解析总线 URL、重拨（Nim 采用指数退避；Go 在其健康 tick 上重试）、重建每个订阅（call、event 与 tap）并重新发布 `reg.publish`——无需重启进程。
+NATS 客户端会透明地重连到同一 URL，但总线在超出其重连预算后仍不可达——或 harness 在新端口上重启——过去会让组件**存活却失聪**：订阅不再投递，没有发出 `reg.depart`，目录仍宣告着无人能到达的工具，恢复只能靠杀死进程。Nim 和 Go SDK 现在监视连接健康（每 2 秒一次 `Flush` 探测），一旦连接不健康持续 `NIF_RECONNECT_GRACE_S`（默认 180 秒，刻意高于客户端自身的耐心），就**重新接入**：重新解析总线 URL（`NIF_NATS_URL` → `$NIF_ROOT/var/nats-url`，绝不猜测众所周知的端口）、在订阅前用 core 公告的 root 验证每个候选、重拨（Nim 采用指数退避；Go 在候选被拒绝时会在其健康 tick 上继续重试发现）、重建每个订阅（call、event 与 tap）并重新发布 `reg.publish`——无需重启进程。总线已消失的组件会以“无处可去”明确失败，而不会迁移到应答众所周知的端口的任何 harness 上。
 
 延迟宣告的组件（Go SDK 的 `DeferAnnounce`，例如 `mcp-bridge`）必须在全新连接上重新发布自己的契约，因为它可能在不健康期间已经漂移；用 `onReattached`（Go 为 `OnReattached`）注册它。普通组件无需钩子——重新接入已经重新宣告了它们冻结的契约。TypeScript SDK 目前尚不重新接入。
 
@@ -2898,7 +2912,7 @@ make build
 | `diagnostic` | `<session>:<id>` | 为显示/存储而持久化的异步 LSP 判定（`{sessionId, path, bytes, text, clean, createdAt}`）。`clean: true` 的整文件判定仅供界面/存储使用，绝不进入模型历史——它在运行器空闲时仍会迟到传递；其他判定还会追加到转录。由 `conversation_delete` 清理 |
 | `selftest` | store 自检探针 | 一次性——由 store 自身的自检往返写入并删除 |
 
-后端是所选引擎——默认是位于 `var/store.db` 的 SQLite，或 DSN 共享的 TiDB 引擎（`NIF_STORE_BACKEND=tidb`，`NIF_STORE_TIDB_DSN`，无 flock——行锁和 rev 计数器在 harness 之间仲裁）。**恰好一个进程拥有该文件**——绝不要对同一个数据库运行两个基于文件的 `store` 进程（对同一 root 启动的第二个核心正是如此；实验时请使用临时的 `NIF_ROOT` 副本）。
+后端是所选引擎——默认是位于 `var/store.db` 的 SQLite，或 DSN 共享的 TiDB 引擎（`NIF_STORE_BACKEND=tidb`，`NIF_STORE_TIDB_DSN`，无 flock——行锁和 rev 计数器在 harness 之间仲裁）。**恰好一个 `store` 进程服务一个 harness**——绝不要对同一个数据库运行两个基于文件的 `store` 进程（对同一 root 启动的第二个核心正是如此；实验时请使用临时的 `NIF_ROOT` 副本）。Core 在该 store 订阅之前拒绝第二个 `store` PID 的总线准入，即使它来自另一个 root；这是协作式准入，因此请一起升级并重启 core 与 store。
 
 `list` 是一页，而不是完整视图（见 [Store engines](#store-engines)）：核心中所有必须看到整个 kind 的地方都走 `storeListAll`——单次有上限的 `list` 在恢复时会静默截断长转录。`search` 则把“哪些会话提到过 …”变成服务端查询，而不是先下载再过滤：`cli call search '{"kind":"conversation","query":"…"}'`（要在转录文本中查找则用 `message`）返回与 `list` 相同的分页结构。
 
@@ -3029,3 +3043,5 @@ SSH 安装可显式选择 `service: "process"`。目标 Linux 主机需预先安
 它也不会使提供商的 SSH 网关新增端口转发能力；Fleet 任务通过 SSH 命令执行。
 只有实际节点 catalog 响应后才保存已验证 receipt。路由保留在私有 receipt 中，
 不改变模型的固定提示前缀，任务结果继续追加到历史。
+
+> 语义检索：memory 验证分支新增 `memory.embedProvider`，通过提供方嵌入模型查询 SQLite 向量；空值使用文本排序，失败时回退。`make install-embed` 安装无需 Ollama 的本地 nomic，`make embed-up` 启用监督启动器；安装本身不会启动服务或修改提供方。自动召回仍是有界的常驻事实。详见英文手册 “Retrieval, honestly labelled”。

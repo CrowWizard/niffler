@@ -141,6 +141,7 @@ type Component struct {
 	owner             *Component
 	inHandler         bool
 	deferAnnounce     bool
+	admissionRequired bool
 	contractMu        sync.RWMutex // protects setup while deferred calls/events can arrive
 	ready             bool
 	// Re-attach (issue #3): callbacks for a successful post-outage re-attach;
@@ -708,6 +709,13 @@ func (c *Component) Connect() error {
 		return err
 	}
 	nc := c.nc
+	if c.admissionRequired {
+		if err := c.admitLocked(); err != nil {
+			nc.Close()
+			c.nc = nil
+			return err
+		}
+	}
 	if c.shutdown == nil {
 		c.shutdown = make(chan struct{})
 	}
@@ -800,9 +808,73 @@ func (c *Component) Connect() error {
 	return nil
 }
 
+// discoveryDescription names the discovery file the caller expected, for the
+// "no bus to connect to" error (a missing NIF_ROOT is itself part of the
+// diagnosis, so both cases are spelled out).
+func discoveryDescription() string {
+	if r := os.Getenv("NIF_ROOT"); r != "" {
+		return filepath.Join(r, "var", "nats-url")
+	}
+	return "$NIF_ROOT/var/nats-url (NIF_ROOT is unset)"
+}
+
+// enforceBusRoot refuses a bus whose core answers for a DIFFERENT harness
+// root.
+//
+// Registering is not the danger — subscribing is. A component joins
+// svc.<name>.call with queue group == its name, so the moment it connects it
+// takes its share of THAT bus's calls, well before a registration could be
+// refused. Measured on a live harness: with a foreign-root store merely
+// connected, the favorites list came back EMPTY on half the calls (alternating
+// full/empty) and provider lookups failed at the same rate — the incident
+// shape, with the database intact. The catalog's root check catches the
+// registration; this catches the subscription.
+//
+// Only POSITIVE proof refuses (a core answered and named another root). A bus
+// with no core yet — boot, a bare nats-server, a unit-test bus — is accepted: a
+// false refusal would be worse than the leak. The refusal is deliberately not
+// overridable: core always exports NIF_NATS_URL to its own children, so a
+// legitimate child never needs an escape hatch.
+func enforceBusRoot(url string) error {
+	mine := HarnessRoot()
+	if mine == "" {
+		return nil
+	}
+	answered := CoreRoot(url, dialTimeout())
+	if answered == "" {
+		return nil
+	}
+	if sameRoot(answered, mine) {
+		return nil
+	}
+	return fmt.Errorf("refusing bus %s: the core there serves %s, not this root "+
+		"(%s) — a component subscribes to its component-name queue group, so "+
+		"staying would answer ANOTHER harness's calls from this root's "+
+		"database (unset NIF_NATS_URL, or point it at this root's var/nats-url)",
+		url, answered, mine)
+}
+
+// sameRoot compares two harness roots after resolving them, so a symlinked
+// install and its target are the same instance.
+func sameRoot(a, b string) bool {
+	ra, erra := filepath.Abs(a)
+	rb, errb := filepath.Abs(b)
+	if erra != nil || errb != nil {
+		return a == b
+	}
+	if sa, err := filepath.EvalSymlinks(ra); err == nil {
+		ra = sa
+	}
+	if sb, err := filepath.EvalSymlinks(rb); err == nil {
+		rb = sb
+	}
+	return ra == rb
+}
+
 // dial resolves the bus URL and connects. Resolution order: NIF_NATS_URL
 // (explicit always wins), the harness root's var/nats-url discovery file
-// (a restarted core usually binds a new port), then the well-known port.
+// (a restarted core usually binds a new port). There is deliberately NO
+// well-known-port fallback for a component — see the guard below.
 func (c *Component) dial() (string, error) {
 	if c.explicitBus && c.explicitURL == "" {
 		return "", fmt.Errorf("explicit bus URL must not be empty")
@@ -821,7 +893,23 @@ func (c *Component) dial() (string, error) {
 		}
 	}
 	if url == "" {
-		url = "nats://127.0.0.1:4222"
+		// Refuse to GUESS the bus. This fallback used to be a silent
+		// `nats://127.0.0.1:4222`, which is fine for a CLIENT hunting its
+		// harness but wrong for a COMPONENT: a component subscribes to its
+		// component-name queue group, so landing on another root's bus makes
+		// it answer a slice of THAT harness's calls from its own database —
+		// intermittent not-founds for rows that exist (favorite lists,
+		// provider nicknames, conversation transcripts) while the database is
+		// perfectly intact. A test/dev root whose var/nats-url is missing is
+		// exactly how that happened (2026-11-10). No env and no discovery
+		// file means there is nowhere legitimate to go.
+		return "", fmt.Errorf("no bus to connect to: NIF_NATS_URL is unset and "+
+			"%s is missing — refusing to guess a bus (a component subscribes "+
+			"by queue group, so the wrong one silently answers another "+
+			"harness's calls)", discoveryDescription())
+	}
+	if err := enforceBusRoot(url); err != nil {
+		return "", err
 	}
 	nc, err := nats.Connect(url,
 		nats.Timeout(dialTimeout()),
@@ -886,8 +974,9 @@ func (c *Component) resubscribe() error {
 }
 
 // reattachCandidates lists bus URLs to try when re-attaching, most likely
-// first: the env URL (the same bus may simply have returned), the discovery
-// file (a restarted core usually binds a new port), the well-known port.
+// first: the env URL (the same bus may simply have returned), then the discovery
+// file (a restarted core usually binds a new port). Never guess a well-known bus:
+// a surviving test component must not migrate into production after its bus dies.
 func (c *Component) reattachCandidates() []string {
 	if c.explicitBus {
 		if c.explicitURL == "" {
@@ -909,7 +998,6 @@ func (c *Component) reattachCandidates() []string {
 			add(strings.TrimSpace(string(data)))
 		}
 	}
-	add("nats://127.0.0.1:4222")
 	return urls
 }
 
@@ -941,6 +1029,11 @@ func (c *Component) reconnectWatch(initialURL string) {
 		nc := c.nc
 		c.contractMu.RUnlock()
 		if nc == nil {
+			// A refused/failed re-attach leaves no connection. Keep retrying
+			// discovery instead of remaining permanently alive-but-deaf.
+			if err := c.reattachNow(); err != nil {
+				slog.Error("re-attach failed — retrying", "component", c.Name, "err", err)
+			}
 			continue
 		}
 		status := nc.Status()
@@ -987,8 +1080,14 @@ func (c *Component) reconnectNow() error {
 		c.nc.Close()
 		c.nc = nil
 	}
-	var lastErr error
+	var lastErr error = fmt.Errorf("no bus to re-attach to: no explicit URL or discovery file")
 	for _, url := range c.reattachCandidates() {
+		if err := enforceBusRoot(url); err != nil {
+			lastErr = err
+			slog.Warn("refusing re-attach candidate", "component", c.Name,
+				"pid", os.Getpid(), "root", HarnessRoot(), "url", url, "err", err)
+			continue
+		}
 		nc, err := nats.Connect(url,
 			nats.Timeout(dialTimeout()),
 			nats.MaxReconnects(-1),
@@ -999,6 +1098,14 @@ func (c *Component) reconnectNow() error {
 			continue
 		}
 		c.nc = nc
+		if c.admissionRequired {
+			if err := c.admitLocked(); err != nil {
+				lastErr = err
+				nc.Close()
+				c.nc = nil
+				continue
+			}
+		}
 		if err := c.resubscribe(); err != nil {
 			lastErr = err
 			nc.Close()
@@ -1012,7 +1119,7 @@ func (c *Component) reconnectNow() error {
 			continue
 		}
 		slog.Info("reattached after the outage — resubscribed and re-announced",
-			"component", c.Name, "url", url)
+			"component", c.Name, "pid", os.Getpid(), "root", HarnessRoot(), "url", url)
 		return nil
 	}
 	return lastErr
@@ -1032,9 +1139,6 @@ func (c *Component) Close() {
 	}
 	c.closeMu.Lock()
 	defer c.closeMu.Unlock()
-	if c.nc == nil {
-		return
-	}
 	// Stop the reconnect watch before tearing the connection down: its
 	// goroutine must not observe (or act on) a half-closed component.
 	c.reconnectStopOnce.Do(func() { close(c.reconnectStop) })
@@ -1062,9 +1166,11 @@ func (c *Component) Close() {
 	c.stopDispatch()
 	c.stopIdle()
 	c.contractMu.Lock()
-	_ = c.nc.FlushTimeout(time.Second)
-	c.nc.Close()
-	c.nc = nil
+	if c.nc != nil {
+		_ = c.nc.FlushTimeout(time.Second)
+		c.nc.Close()
+		c.nc = nil
+	}
 	c.contractMu.Unlock()
 }
 
@@ -1265,13 +1371,55 @@ func (c *Component) announce(subject string) error {
 	return c.announceLocked(subject)
 }
 
-func (c *Component) announceLocked(subject string) error {
+// RequireAdmission opts a single-writer service into core admission BEFORE
+// acquiring a call subscription, on initial connect and full re-attach.
+// Call before Connect. A bare bus (no reg subscribers) remains usable in tests;
+// a core that is present but cannot acknowledge admission fails closed.
+func (c *Component) RequireAdmission() *Component {
+	c.admissionRequired = true
+	return c
+}
+
+func (c *Component) admitLocked() error {
+	data, err := c.registrationData()
+	if err != nil {
+		return err
+	}
+	msg, err := c.nc.Request("reg.admit", data, 5*time.Second)
+	if err == nats.ErrNoResponders {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("registration admission failed (core must support reg.admit): %w", err)
+	}
+	var verdict struct {
+		OK     bool   `json:"ok"`
+		Name   string `json:"name"`
+		PID    int    `json:"pid"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(msg.Data, &verdict); err != nil {
+		return fmt.Errorf("invalid registration admission: %w", err)
+	}
+	if !verdict.OK || verdict.Name != c.Name || verdict.PID != os.Getpid() {
+		return fmt.Errorf("registration rejected for %s pid %d: %s", c.Name, os.Getpid(), verdict.Reason)
+	}
+	return nil
+}
+
+func (c *Component) registrationData() ([]byte, error) {
 	tools := make([]map[string]any, 0, len(c.tools))
 	for _, t := range c.tools {
 		tools = append(tools, map[string]any{"name": t.Name, "schema": t.Schema})
 	}
 	payload := map[string]any{
 		"name": c.Name, "version": c.Version, "pid": os.Getpid(), "tools": tools,
+		// The root this component serves: core refuses a registration from
+		// another root (that process subscribed to its component-name queue
+		// group on this bus and would answer a slice of THIS harness's calls
+		// from a different database). See the reg.publish guard in
+		// core/catalog.nim.
+		"root": HarnessRoot(),
 	}
 	if len(c.slash) > 0 {
 		payload["slash"] = c.slash
@@ -1279,7 +1427,11 @@ func (c *Component) announceLocked(subject string) error {
 	if c.Client {
 		payload["client"] = true
 	}
-	data, err := json.Marshal(payload)
+	return json.Marshal(payload)
+}
+
+func (c *Component) announceLocked(subject string) error {
+	data, err := c.registrationData()
 	if err != nil {
 		return err
 	}
